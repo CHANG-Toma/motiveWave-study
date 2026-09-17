@@ -52,18 +52,22 @@ Remove-Item -Recurse -Force $devDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $devDir | Out-Null
 Copy-Item -Recurse -Force (Join-Path $classesDir "*") $devDir
 
-$jarPath = Join-Path $extDir "gexbot_custom_majors.jar"
-$jarOk = $false
+# Remove any old custom jars (single canonical name: gexbot_majors.jar)
+foreach ($old in @("gexbot_custom_majors.jar", "gexbot_custom_majors_v2.jar")) {
+  Remove-Item (Join-Path $extDir $old) -Force -ErrorAction SilentlyContinue
+}
+
+$jarPath = Join-Path $extDir "gexbot_majors.jar"
 try {
   if (Test-Path $jarPath) { Remove-Item $jarPath -Force -ErrorAction Stop }
   & jar cf $jarPath -C $classesDir .
-  $jarOk = $true
+  if ($LASTEXITCODE -ne 0) { throw "jar creation failed" }
   Write-Host "OK jar: $jarPath"
 }
 catch {
-  $altJar = Join-Path $extDir "gexbot_custom_majors_v2.jar"
-  & jar cf $altJar -C $classesDir .
-  Write-Host "WARN jar locked. Wrote $altJar instead. Close MotiveWave and redeploy."
+  Write-Host "WARN jar locked by MotiveWave - skipped jar replace."
+  Write-Host "dev/ + .last_updated were written so MotiveWave can hot-reload."
+  Write-Host "If the chart does not update, remove/re-add the study (no need to close MotiveWave)."
 }
 
 New-Item -ItemType Directory -Force -Path $extDir | Out-Null

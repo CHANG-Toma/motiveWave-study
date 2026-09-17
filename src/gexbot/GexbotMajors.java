@@ -3,6 +3,11 @@ package gexbot;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.geom.Line2D;
+import java.awt.geom.Rectangle2D;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
@@ -12,14 +17,19 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.DayOfWeek;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.motivewave.platform.sdk.common.Coordinate;
 import com.motivewave.platform.sdk.common.DataContext;
 import com.motivewave.platform.sdk.common.Defaults;
-import com.motivewave.platform.sdk.common.Enums;
+import com.motivewave.platform.sdk.common.DrawContext;
 import com.motivewave.platform.sdk.common.NVP;
 import com.motivewave.platform.sdk.common.PathInfo;
 import com.motivewave.platform.sdk.common.Util;
@@ -29,8 +39,7 @@ import com.motivewave.platform.sdk.common.desc.DoubleDescriptor;
 import com.motivewave.platform.sdk.common.desc.IntegerDescriptor;
 import com.motivewave.platform.sdk.common.desc.PathDescriptor;
 import com.motivewave.platform.sdk.common.desc.StringDescriptor;
-import com.motivewave.platform.sdk.draw.Label;
-import com.motivewave.platform.sdk.draw.Line;
+import com.motivewave.platform.sdk.draw.Figure;
 import com.motivewave.platform.sdk.study.Study;
 import com.motivewave.platform.sdk.study.StudyHeader;
 
@@ -63,12 +72,17 @@ public class GexbotMajors extends Study
   static final String ZERO_PATH = "zeroPath";
   static final String CALL_PATH = "callPath";
   static final String PUT_PATH = "putPath";
+  static final String IV68_PATH = "iv68Path";
+  static final String IV80_PATH = "iv80Path";
+  static final String ATM_IV = "atmIvPct";
 
   static final String SHOW_HUD = "showHud";
   static final String SHOW_REGIME = "showRegime";
+  static final String SHOW_STRATEGY = "showStrategy";
   static final String SHOW_LEVEL_LABELS = "showLevelLabels";
   static final String SHOW_MAX_CHANGE = "showMaxChange";
   static final String SHOW_ERRORS = "showErrors";
+  static final String HUD_POS = "hudPosition";
 
   static final String BASE_URL = "https://api.gex.bot/v2";
   static final Path DEBUG_LOG = Path.of(System.getProperty("user.home"), "MotiveWave Extensions", "gexbot_majors_debug.txt");
@@ -76,9 +90,13 @@ public class GexbotMajors extends Study
   static final Color C_CALL = new Color(46, 204, 113);
   static final Color C_PUT = new Color(231, 76, 60);
   static final Color C_ZG = new Color(243, 156, 18);
+  static final Color C_IV68 = new Color(219, 88, 228);
+  static final Color C_IV80 = new Color(176, 92, 232);
   static final Color C_HUD_BG = new Color(20, 22, 28);
   static final Color C_REGIME_NEG = new Color(170, 35, 35);
   static final Color C_REGIME_POS = new Color(25, 120, 65);
+  /** Normal z for a two-tailed 80% interval. 68% uses 1σ. */
+  static final double Z_80 = 1.2815515655446004;
 
   private final AtomicBoolean fetching = new AtomicBoolean(false);
   private volatile MajorsData lastData;
@@ -89,6 +107,8 @@ public class GexbotMajors extends Study
   private volatile long lastFetchMs;
   private volatile String lastStatus = "Waiting...";
   private volatile DataContext latestCtx;
+  private volatile Double lastIv;
+  private volatile Double lastSigma1;
 
   @Override
   public void initialize(Defaults defaults)
@@ -126,15 +146,24 @@ public class GexbotMajors extends Study
     grp.addRow(new IntegerDescriptor(REFRESH_SEC, "Refresh (sec)", 15, 5, 600, 5));
     grp.addRow(new DoubleDescriptor(STRIKE_MULT, "Strike Multiplier", 1.0, 0.01, 1000.0, 0.01));
     grp.addRow(new DoubleDescriptor(STRIKE_ADD, "Strike Offset", 0.0, -100000.0, 100000.0, 0.25));
+    grp.addRow(new DoubleDescriptor(ATM_IV, "ATM IV % (0 = auto VIX/VXN)", 0.0, 0.0, 200.0, 0.1));
 
     tab = sd.addTab("Display");
     grp = tab.addGroup("Levels");
-    grp.addRow(new PathDescriptor(ZERO_PATH, "Zero Gamma", C_ZG, 2.0f, null, true, false, true));
-    grp.addRow(new PathDescriptor(CALL_PATH, "Call Wall", C_CALL, 2.0f, null, true, false, true));
-    grp.addRow(new PathDescriptor(PUT_PATH, "Put Wall", C_PUT, 2.0f, null, true, false, true));
+    grp.addRow(new PathDescriptor(ZERO_PATH, "Zero Gamma", C_ZG, 1.0f, null, true, false, true));
+    grp.addRow(new PathDescriptor(CALL_PATH, "Call Wall", C_CALL, 1.0f, null, true, false, true));
+    grp.addRow(new PathDescriptor(PUT_PATH, "Put Wall", C_PUT, 1.0f, null, true, false, true));
+    grp.addRow(new PathDescriptor(IV68_PATH, "IV Range (68%)", C_IV68, 1.0f, new float[] { 6f, 5f }, true, false, true));
+    grp.addRow(new PathDescriptor(IV80_PATH, "IV Range (80%)", C_IV80, 1.0f, new float[] { 6f, 5f }, true, false, true));
 
     grp = tab.addGroup("UX / HUD (keep chart clean)");
-    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Regime Badge", true));
+    grp.addRow(new DiscreteDescriptor(HUD_POS, "HUD Position", "TR", Arrays.asList(
+        new NVP("Top Right", "TR"),
+        new NVP("Top Left", "TL"),
+        new NVP("Bottom Right", "BR"),
+        new NVP("Bottom Left", "BL"))));
+    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Quadrant Badge", true));
+    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "Strategy Hint", true));
     grp.addRow(new BooleanDescriptor(SHOW_HUD, "Compact Info Panel", true));
     grp.addRow(new BooleanDescriptor(SHOW_LEVEL_LABELS, "Level Labels (right)", true));
     grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE, "Max Change Panel", true));
@@ -152,6 +181,8 @@ public class GexbotMajors extends Study
     lastData = null;
     lastMaxChange = null;
     lastConversion = Conversion.identity();
+    lastIv = null;
+    lastSigma1 = null;
     logDebug("onLoad");
   }
 
@@ -213,9 +244,15 @@ public class GexbotMajors extends Study
           mx = fetchMaxChange(req);
         }
 
+        if (ivRangeEnabled()) {
+          Double iv = fetchAtmIv(req.ticker);
+          if (iv != null) lastIv = iv;
+        }
+
         if (data != null) {
           lastData = data;
           lastMaxChange = mx;
+          lastSigma1 = computeSigma1(data, lastIv, req.category);
           lastFetchMs = System.currentTimeMillis();
           setStatus("OK");
         }
@@ -254,56 +291,59 @@ public class GexbotMajors extends Study
     MajorsData data = lastData;
 
     if (data != null && series != null && series.size() >= 2) {
-      long t1 = series.getStartTime(0);
-      long t2 = series.getStartTime(series.size() - 1);
-
-      // Text is drawn ON the line (MotiveWave Label figures are unreliable here)
-      addLevel(ZERO_PATH, "ZERO GAMMA", convertPrice(data.zeroGamma), t1, t2, C_ZG);
-      addLevel(CALL_PATH, "CALL WALL", convertPrice(data.mposVol), t1, t2, C_CALL);
-      addLevel(PUT_PATH, "PUT WALL", convertPrice(data.mnegVol), t1, t2, C_PUT);
-
-      addHud(ctx, data);
+      addLevel(ZERO_PATH, "ZERO GAMMA", convertPrice(data.zeroGamma), C_ZG, false);
+      addLevel(CALL_PATH, "CALL WALL", convertPrice(data.mposVol), C_CALL, false);
+      addLevel(PUT_PATH, "PUT WALL", convertPrice(data.mnegVol), C_PUT, false);
+      addIvLevels(data);
+      addHud(data);
     }
 
     if (getSettings().getBoolean(SHOW_ERRORS, true)
         && lastStatus != null
         && (lastStatus.startsWith("ERR") || lastStatus.startsWith("WARN"))) {
-      addErrorLabel(ctx);
+      String pos = trim(getSettings().getString(HUD_POS));
+      if (Util.isEmpty(pos)) pos = "TR";
+      PanelFigure err = new PanelFigure(lastStatus, C_REGIME_NEG, Color.WHITE, false);
+      // Offset below/above the HUD stack (max 4 rows) so it never overlaps
+      err.setPlacement(8 + 4 * 28, pos.endsWith("R"), pos.startsWith("B"));
+      addFigure(err);
     }
 
     endFigureUpdate();
     notifyRedraw();
   }
 
-  private void addHud(DataContext ctx, MajorsData data)
+  private void addHud(MajorsData data)
   {
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 2) return;
+    String pos = trim(getSettings().getString(HUD_POS));
+    if (Util.isEmpty(pos)) pos = "TR";
+    boolean right = pos.endsWith("R");
+    boolean bottom = pos.startsWith("B");
 
-    int idx = series.size() - 1;
-    long t = series.getStartTime(idx);
-    double px = series.getHigh(idx);
-    if (Double.isNaN(px)) px = series.getClose(idx);
-
-    boolean negative = isNegativeRegime(data);
-    String regimeTxt = negative ? "NEGATIVE REGIME" : "POSITIVE REGIME";
-    Color regimeBg = negative ? C_REGIME_NEG : C_REGIME_POS;
+    // "The 4 Quadrants" cheatsheet: Read the Flip. Know the GEX. Execute the Right Play.
+    int q = quadrant(data);
+    java.util.List<PanelFigure> rows = new java.util.ArrayList<>();
 
     if (getSettings().getBoolean(SHOW_REGIME, true)) {
-      // Use a short guide line + text so the badge always renders with the study lines
-      Line regimeLine = new Line(t, px, t, px);
-      regimeLine.setColor(regimeBg);
-      regimeLine.setStroke(new BasicStroke(1f));
-      regimeLine.setText(regimeTxt, new Font("SansSerif", Font.BOLD, 14));
-      if (regimeLine.getText() != null) {
-        regimeLine.getText().setTextColor(Color.WHITE);
-        regimeLine.getText().setBackground(regimeBg);
-        regimeLine.getText().setShowOutline(true);
-        regimeLine.getText().setShowBorder(true);
-        regimeLine.getText().setBorderColor(Color.WHITE);
-        regimeLine.getText().setInsets(5, 10, 5, 10);
+      String badge;
+      Color bg;
+      switch (q) {
+        case 1 -> { badge = "Q1  RANGE BOUND   Above Flip / +GEX"; bg = C_REGIME_POS; }
+        case 2 -> { badge = "Q2  MOVING   Above Flip / -GEX"; bg = C_REGIME_NEG; }
+        case 3 -> { badge = "Q3  INTERACTION   Below Flip / +GEX"; bg = C_REGIME_POS; }
+        default -> { badge = "Q4  TRENDING   Below Flip / -GEX"; bg = C_REGIME_NEG; }
       }
-      addFigure(regimeLine);
+      rows.add(new PanelFigure(badge, bg, Color.WHITE, true));
+    }
+
+    if (getSettings().getBoolean(SHOW_STRATEGY, true)) {
+      String strat = switch (q) {
+        case 1 -> "Fade extremes: buy low, sell high in range. Watch key levels for rejection & bounces.";
+        case 2 -> "Smaller size, wait for confirmation. Let price show strength before you join the move.";
+        case 3 -> "Watch flip closely: bounces & rejections are common. Trade S/R, react fast.";
+        default -> "Play momentum, trade with strength. Tight risk management, let winners run.";
+      };
+      rows.add(new PanelFigure(strat, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
     if (getSettings().getBoolean(SHOW_HUD, true)) {
@@ -313,51 +353,49 @@ public class GexbotMajors extends Study
       Double spotFx = convertPrice(data.spot);
       String src = lastTicker + (Util.isEmpty(lastFuture) ? "" : ("->" + lastFuture));
 
-      // One compact single-line HUD (no multiline - MW often drops \n labels)
-      String hud = src + " | Spot " + formatPrice(spotFx)
-          + " | ZG " + formatPrice(zg) + distToZg(spotFx, zg)
-          + " | Net " + formatSigned(data.netGexVol)
-          + " | Call " + formatPrice(call)
-          + " | Put " + formatPrice(put);
-
-      // Place slightly below the regime badge using last low as anchor
-      double hudY = series.getLow(idx);
-      if (Double.isNaN(hudY)) hudY = px;
-      Line hudLine = new Line(t, hudY, t, hudY);
-      hudLine.setColor(C_HUD_BG);
-      hudLine.setStroke(new BasicStroke(1f));
-      hudLine.setText(hud, new Font("SansSerif", Font.PLAIN, 12));
-      if (hudLine.getText() != null) {
-        hudLine.getText().setTextColor(new Color(235, 235, 235));
-        hudLine.getText().setBackground(C_HUD_BG);
-        hudLine.getText().setShowOutline(true);
-        hudLine.getText().setShowBorder(true);
-        hudLine.getText().setBorderColor(new Color(90, 90, 90));
-        hudLine.getText().setInsets(4, 8, 4, 8);
-      }
-      addFigure(hudLine);
+      String hud = src
+          + "   Spot " + formatPrice(spotFx)
+          + "   |  Ceiling " + formatPrice(call)
+          + "   Flip " + formatPrice(zg) + distToZg(spotFx, zg)
+          + "   Floor " + formatPrice(put)
+          + "   |  Net " + formatSigned(data.netGexVol)
+          + ivHudSuffix(data);
+      rows.add(new PanelFigure(hud, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
     if (getSettings().getBoolean(SHOW_MAX_CHANGE, true) && lastMaxChange != null) {
       String mx = buildMaxChangeOneLine(lastMaxChange);
       if (!Util.isEmpty(mx)) {
-        double mid = (series.getHigh(idx) + series.getLow(idx)) / 2.0;
-        if (Double.isNaN(mid)) mid = px;
-        Line mxLine = new Line(t, mid, t, mid);
-        mxLine.setColor(new Color(40, 40, 55));
-        mxLine.setStroke(new BasicStroke(1f));
-        mxLine.setText(mx, new Font("SansSerif", Font.PLAIN, 11));
-        if (mxLine.getText() != null) {
-          mxLine.getText().setTextColor(new Color(210, 210, 220));
-          mxLine.getText().setBackground(new Color(25, 25, 35));
-          mxLine.getText().setShowOutline(true);
-          mxLine.getText().setShowBorder(true);
-          mxLine.getText().setBorderColor(new Color(80, 80, 100));
-          mxLine.getText().setInsets(3, 6, 3, 6);
-        }
-        addFigure(mxLine);
+        rows.add(new PanelFigure(mx, new Color(25, 25, 35), new Color(210, 210, 220), false));
       }
     }
+
+    placeRows(rows, right, bottom);
+  }
+
+  /** Stack HUD panels in the chosen chart corner (badge always on top). */
+  private void placeRows(java.util.List<PanelFigure> rows, boolean right, boolean bottom)
+  {
+    int rowH = 28;
+    int n = rows.size();
+    for (int i = 0; i < n; i++) {
+      PanelFigure p = rows.get(i);
+      int off = bottom ? 8 + (n - 1 - i) * rowH : 8 + i * rowH;
+      p.setPlacement(off, right, bottom);
+      addFigure(p);
+    }
+  }
+
+  /**
+   * 4 Quadrants: flip = spot vs zero gamma, GEX sign = net gex (volume).
+   * Q1 Above+Pos, Q2 Above+Neg, Q3 Below+Pos, Q4 Below+Neg.
+   */
+  private static int quadrant(MajorsData data)
+  {
+    boolean aboveFlip = data.spot == null || data.zeroGamma == null || data.spot >= data.zeroGamma;
+    boolean posGex = data.netGexVol == null || data.netGexVol >= 0;
+    if (aboveFlip) return posGex ? 1 : 2;
+    return posGex ? 3 : 4;
   }
 
   private String buildMaxChangeOneLine(MaxChangeData mx)
@@ -379,25 +417,6 @@ public class GexbotMajors extends Study
         .append(formatSigned(pair[1]));
   }
 
-  private String buildMaxChangeText(MaxChangeData mx)
-  {
-    return buildMaxChangeOneLine(mx);
-  }
-
-  private void appendMx(StringBuilder sb, String tf, double[] pair)
-  {
-    appendMxInline(sb, tf, pair);
-  }
-
-  private static boolean isNegativeRegime(MajorsData data)
-  {
-    if (data.spot != null && data.zeroGamma != null) {
-      return data.spot < data.zeroGamma;
-    }
-    if (data.netGexVol != null) return data.netGexVol < 0;
-    return false;
-  }
-
   private static String distToZg(Double spot, Double zg)
   {
     if (spot == null || zg == null) return "";
@@ -405,68 +424,269 @@ public class GexbotMajors extends Study
     return " (" + (d >= 0 ? "+" : "") + String.format("%.0f", d) + ")";
   }
 
-  private void addErrorLabel(DataContext ctx)
+  private String ivHudSuffix(MajorsData data)
   {
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 1) return;
-    int idx = series.size() - 1;
-    long t = series.getStartTime(idx);
-    double px = series.getClose(idx);
-    Line err = new Line(t, px, t, px);
-    err.setColor(C_PUT);
-    err.setText(lastStatus, new Font("SansSerif", Font.BOLD, 12));
-    if (err.getText() != null) {
-      err.getText().setTextColor(Color.WHITE);
-      err.getText().setBackground(C_REGIME_NEG);
-      err.getText().setShowOutline(true);
-      err.getText().setInsets(4, 8, 4, 8);
-    }
-    addFigure(err);
+    if (lastSigma1 == null || data == null || data.spot == null) return "";
+    Double one = convertMove(lastSigma1);
+    Double eighty = convertMove(lastSigma1 * Z_80);
+    String ivPct = lastIv == null ? "" : String.format("  IV %.1f%%", lastIv * 100.0);
+    return "   |  IV68 ±" + formatPrice(one) + "  IV80 ±" + formatPrice(eighty) + ivPct;
   }
 
-  private void addLevel(String pathKey, String name, Double price, long t1, long t2, Color fallbackColor)
+  private Double convertMove(double sourcePoints)
+  {
+    Double a = convertPrice(0.0);
+    Double b = convertPrice(sourcePoints);
+    if (a == null || b == null) return sourcePoints;
+    return Math.abs(b - a);
+  }
+
+  private boolean ivRangeEnabled()
+  {
+    PathInfo a = getSettings().getPath(IV68_PATH);
+    PathInfo b = getSettings().getPath(IV80_PATH);
+    boolean aOn = a == null || a.isEnabled();
+    boolean bOn = b == null || b.isEnabled();
+    return aOn || bOn;
+  }
+
+  private void addIvLevels(MajorsData data)
+  {
+    if (data == null || data.spot == null || lastSigma1 == null) return;
+    addIvBand(IV68_PATH, "IV 68%", data.spot, lastSigma1, 1.0, C_IV68);
+    addIvBand(IV80_PATH, "IV 80%", data.spot, lastSigma1, Z_80, C_IV80);
+  }
+
+  private void addIvBand(String pathKey, String name, double spot, double sigma1, double z, Color color)
+  {
+    PathInfo path = getSettings().getPath(pathKey);
+    if (path != null && !path.isEnabled()) return;
+    addLevel(pathKey, name + " H", convertPrice(spot + z * sigma1), color, true);
+    addLevel(pathKey, name + " L", convertPrice(spot - z * sigma1), color, true);
+  }
+
+  private static Double computeSigma1(MajorsData data, Double iv, String category)
+  {
+    if (data == null || data.spot == null || iv == null || iv <= 0) return null;
+    double dte = remainingDteDays(category);
+    return data.spot * iv * Math.sqrt(dte / 365.0);
+  }
+
+  /** gexbot 0DTE formula: seconds remaining to 16:00 ET / 86400. */
+  private static double remainingDteDays(String category)
+  {
+    ZoneId ny = ZoneId.of("America/New_York");
+    ZonedDateTime now = ZonedDateTime.now(ny);
+    LocalDate day = now.toLocalDate();
+    if (!now.toLocalTime().isBefore(LocalTime.of(16, 0))) day = day.plusDays(1);
+    while (day.getDayOfWeek() == DayOfWeek.SATURDAY || day.getDayOfWeek() == DayOfWeek.SUNDAY) {
+      day = day.plusDays(1);
+    }
+    ZonedDateTime close = day.atTime(16, 0).atZone(ny);
+    double frac = Math.max(60.0, Duration.between(now, close).getSeconds()) / 86400.0;
+    if ("gex_one".equalsIgnoreCase(category) || "one".equalsIgnoreCase(category)) frac += 1.0;
+    return frac;
+  }
+
+  private Double fetchAtmIv(String ticker)
+  {
+    double manual = getSettings().getDouble(ATM_IV, 0.0);
+    if (manual > 0.5) return manual / 100.0;
+    String yahoo = ivYahooSymbol(ticker);
+    Double px = fetchPublicLast(yahoo);
+    if (px != null && px > 1 && px < 250) {
+      logDebug("ATM IV from " + yahoo + " = " + px);
+      return px / 100.0;
+    }
+    logDebug("ATM IV unavailable for " + ticker + " (" + yahoo + ")");
+    return lastIv;
+  }
+
+  private static String ivYahooSymbol(String ticker)
+  {
+    String t = ticker == null ? "" : ticker.toUpperCase();
+    if (t.contains("NDX") || t.contains("QQQ") || t.equals("NQ")) return "%5EVXN";
+    if (t.contains("RUT") || t.contains("IWM") || t.equals("RTY")) return "%5ERVX";
+    return "%5EVIX";
+  }
+
+  private Double fetchPublicLast(String yahooSymbol)
+  {
+    try {
+      String url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahooSymbol + "?interval=1d&range=1d";
+      HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(8000);
+      conn.setReadTimeout(8000);
+      conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.4");
+      conn.setRequestProperty("Accept", "application/json");
+      int code = conn.getResponseCode();
+      String body = readBody(code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream());
+      if (code < 200 || code >= 300) {
+        logDebug("IV HTTP " + code + " " + abbreviate(body, 120));
+        return null;
+      }
+      Double px = MajorsData.readNumber(body, "regularMarketPrice");
+      if (px == null) px = MajorsData.readNumber(body, "regularMarketPreviousClose");
+      return px;
+    }
+    catch (Exception ex) {
+      logDebug("IV fetch " + safeMsg(ex.getMessage()));
+      return null;
+    }
+  }
+
+  private void addLevel(String pathKey, String name, Double price, Color fallbackColor, boolean dashed)
   {
     if (price == null || Double.isNaN(price)) return;
     PathInfo path = getSettings().getPath(pathKey);
     if (path != null && !path.isEnabled()) return;
 
     Color color = fallbackColor;
-    float width = 2.0f;
+    float width = 1.0f;
     if (path != null) {
       if (path.getColor() != null) color = path.getColor();
       if (path.getStrokeWidth() > 0) width = path.getStrokeWidth();
     }
 
-    Line line = new Line(t1, price, t2, price);
-    line.setExtendLeftBounds(true);
-    line.setExtendRightBounds(true);
-    line.setColor(color);
-    line.setStroke(new BasicStroke(width, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f,
-        new float[] { 8f, 5f }, 0f));
-
-    if (getSettings().getBoolean(SHOW_LEVEL_LABELS, true)) {
-      line.setText(name + "  " + formatPrice(price), new Font("SansSerif", Font.BOLD, 12));
-      if (line.getText() != null) {
-        line.getText().setTextColor(Color.WHITE);
-        line.getText().setBackground(color);
-        line.getText().setShowOutline(true);
-        line.getText().setShowBorder(true);
-        line.getText().setBorderColor(Color.WHITE);
-        line.getText().setInsets(3, 7, 3, 7);
-      }
-    }
-    addFigure(line);
+    boolean showLabel = getSettings().getBoolean(SHOW_LEVEL_LABELS, true);
+    String label = showLabel ? (name + "  " + formatPrice(price)) : null;
+    addFigure(new LevelFigure(price, color, width, label, dashed));
   }
 
-  private static void styleBadge(Label label, Color text, Color bg, Font font, Color border)
+  /** Solid thin level line with a plain colored text label above it. */
+  private static class LevelFigure extends Figure
   {
-    label.getText().setTextColor(text);
-    label.getText().setFont(font);
-    label.getText().setShowOutline(true);
-    label.getText().setShowBorder(true);
-    label.getText().setBorderColor(border);
-    label.getText().setBackground(bg);
-    label.getText().setInsets(4, 8, 4, 8);
+    private final double price;
+    private final Color color;
+    private final float width;
+    private final String label;
+    private final boolean dashed;
+    private Line2D.Double line;
+
+    LevelFigure(double price, Color color, float width, String label, boolean dashed)
+    {
+      this.price = price;
+      this.color = color;
+      this.width = width;
+      this.label = label;
+      this.dashed = dashed;
+    }
+
+    @Override
+    public boolean isVisible(DrawContext ctx)
+    {
+      return true;
+    }
+
+    @Override
+    public void layout(DrawContext ctx)
+    {
+      Rectangle gb = ctx.getBounds();
+      double y = ctx.translateValueD(price);
+      line = new Line2D.Double(gb.getX(), y, gb.getMaxX(), y);
+      setBounds(new Rectangle2D.Double(gb.getX(), y - 20, gb.getWidth(), 24));
+    }
+
+    @Override
+    public void draw(Graphics2D gc, DrawContext ctx)
+    {
+      if (line == null) return;
+      if (dashed) {
+        gc.setStroke(new BasicStroke(width, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f,
+            new float[] { 6f, 5f }, 0f));
+      }
+      else {
+        gc.setStroke(new BasicStroke(width));
+      }
+      gc.setColor(color);
+      gc.draw(line);
+
+      if (label != null) {
+        Font font = new Font("SansSerif", Font.BOLD, 12);
+        gc.setFont(font);
+        FontMetrics fm = gc.getFontMetrics(font);
+        Rectangle gb = ctx.getBounds();
+        int tw = fm.stringWidth(label);
+        // Plain colored text just above the line, right-aligned
+        int tx = (int) gb.getMaxX() - tw - 12;
+        int ty = (int) Math.round(line.getY1()) - 5;
+        gc.setColor(color);
+        gc.drawString(label, tx, ty);
+      }
+    }
+  }
+
+  /** Screen-space HUD panel anchored in a chart corner (TL/TR/BL/BR). */
+  private static class PanelFigure extends Figure
+  {
+    private final String text;
+    private final Color bg;
+    private final Color fg;
+    private final boolean bold;
+    private int yOff = 8;
+    private boolean right;
+    private boolean bottom;
+    private Rectangle2D.Double box;
+
+    PanelFigure(String text, Color bg, Color fg, boolean bold)
+    {
+      this.text = text;
+      this.bg = bg;
+      this.fg = fg;
+      this.bold = bold;
+    }
+
+    void setPlacement(int yOff, boolean right, boolean bottom)
+    {
+      this.yOff = yOff;
+      this.right = right;
+      this.bottom = bottom;
+    }
+
+    @Override
+    public boolean isVisible(DrawContext ctx)
+    {
+      return true;
+    }
+
+    @Override
+    public void layout(DrawContext ctx)
+    {
+      // Hit-test area = the panel box only (estimated; refined in draw).
+      Rectangle gb = ctx.getBounds();
+      int boxW = (text == null ? 0 : text.length() * 7) + 20;
+      int boxH = 24;
+      int bx = right ? (int) gb.getMaxX() - boxW - 8 : (int) gb.getX() + 8;
+      int by = bottom ? (int) gb.getMaxY() - yOff - boxH : (int) gb.getY() + yOff;
+      setBounds(new Rectangle2D.Double(bx, by, boxW, boxH));
+    }
+
+    @Override
+    public void draw(Graphics2D gc, DrawContext ctx)
+    {
+      if (Util.isEmpty(text)) return;
+      Rectangle gb = ctx.getBounds();
+      Font font = new Font("SansSerif", bold ? Font.BOLD : Font.PLAIN, bold ? 13 : 12);
+      gc.setFont(font);
+      FontMetrics fm = gc.getFontMetrics(font);
+      int tw = fm.stringWidth(text);
+      int th = fm.getHeight();
+      int padX = 10;
+      int padY = 6;
+      int boxW = tw + padX * 2;
+      int boxH = th + padY;
+      int bx = right ? (int) gb.getMaxX() - boxW - 8 : (int) gb.getX() + 8;
+      int by = bottom ? (int) gb.getMaxY() - yOff - boxH : (int) gb.getY() + yOff;
+      box = new Rectangle2D.Double(bx, by, boxW, boxH);
+      setBounds(box);
+
+      gc.setColor(bg);
+      gc.fill(box);
+      gc.setColor(fg);
+      gc.draw(box);
+      gc.drawString(text, bx + padX, by + fm.getAscent() + padY / 2);
+    }
   }
 
   private ResolvedRequest resolveRequest(DataContext ctx)
