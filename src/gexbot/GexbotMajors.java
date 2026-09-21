@@ -55,7 +55,7 @@ import com.motivewave.platform.sdk.study.StudyHeader;
     id = "GEXBOT_MAJORS",
     name = "Gexbot Majors (Custom)",
     label = "Gexbot Majors",
-    desc = "HUD Regime + Call/Put Wall + Zero Gamma (Classic). Requires a Custom API key.",
+    desc = "Call/Put/Zero Gamma levels + regime badge + live action plan. Requires a Custom API key.",
     menu = "Gexbot",
     overlay = true,
     studyOverlay = true)
@@ -72,8 +72,14 @@ public class GexbotMajors extends Study
   static final String ZERO_PATH = "zeroPath";
   static final String CALL_PATH = "callPath";
   static final String PUT_PATH = "putPath";
+  static final String CALL_OI_PATH = "callOiPath";
+  static final String PUT_OI_PATH = "putOiPath";
   static final String IV68_PATH = "iv68Path";
   static final String IV80_PATH = "iv80Path";
+  static final String MX_PATH = "maxChangePath";
+  static final String DUAL_ZERO_PATH = "dualZeroPath";
+  static final String DUAL_CALL_PATH = "dualCallPath";
+  static final String DUAL_PUT_PATH = "dualPutPath";
   static final String ATM_IV = "atmIvPct";
 
   static final String SHOW_HUD = "showHud";
@@ -81,6 +87,9 @@ public class GexbotMajors extends Study
   static final String SHOW_STRATEGY = "showStrategy";
   static final String SHOW_LEVEL_LABELS = "showLevelLabels";
   static final String SHOW_MAX_CHANGE = "showMaxChange";
+  static final String SHOW_MAX_CHANGE_LEVELS = "showMaxChangeLevels";
+  static final String SHOW_DUAL_HORIZON = "showDualHorizon";
+  static final String SHOW_OI_DIVERGE = "showOiDiverge";
   static final String SHOW_ERRORS = "showErrors";
   static final String HUD_POS = "hudPosition";
 
@@ -89,17 +98,31 @@ public class GexbotMajors extends Study
 
   static final Color C_CALL = new Color(46, 204, 113);
   static final Color C_PUT = new Color(231, 76, 60);
+  static final Color C_CALL_OI = new Color(26, 160, 90);
+  static final Color C_PUT_OI = new Color(180, 50, 45);
   static final Color C_ZG = new Color(243, 156, 18);
   static final Color C_IV68 = new Color(219, 88, 228);
   static final Color C_IV80 = new Color(176, 92, 232);
+  static final Color C_MX = new Color(52, 152, 219);
+  static final Color C_DUAL_ZG = new Color(241, 196, 15);
+  static final Color C_DUAL_CALL = new Color(39, 174, 96);
+  static final Color C_DUAL_PUT = new Color(192, 57, 43);
   static final Color C_HUD_BG = new Color(20, 22, 28);
   static final Color C_REGIME_NEG = new Color(170, 35, 35);
   static final Color C_REGIME_POS = new Color(25, 120, 65);
+  static final Color C_WARN = new Color(180, 120, 30);
   /** Normal z for a two-tailed 80% interval. 68% uses 1σ. */
   static final double Z_80 = 1.2815515655446004;
+  /** Strikes farther than this (source units) count as Vol vs OI divergence. */
+  static final double OI_DIVERGE_PTS = 2.0;
+  /** Near a wall when within this fraction of the Call–Put range (fallback: 0.35% of spot). */
+  static final double NEAR_FRAC = 0.12;
+  static final double NEAR_SPOT_FRAC = 0.0035;
 
   private final AtomicBoolean fetching = new AtomicBoolean(false);
   private volatile MajorsData lastData;
+  private volatile MajorsData lastDualData;
+  private volatile String lastDualCategory = "";
   private volatile MaxChangeData lastMaxChange;
   private volatile Conversion lastConversion = Conversion.identity();
   private volatile String lastTicker = "";
@@ -149,25 +172,37 @@ public class GexbotMajors extends Study
     grp.addRow(new DoubleDescriptor(ATM_IV, "ATM IV % (0 = auto VIX/VXN)", 0.0, 0.0, 200.0, 0.1));
 
     tab = sd.addTab("Display");
-    grp = tab.addGroup("Levels");
+    // Core: Call / Put / Zero + regime + diverge. Everything else off by default.
+    grp = tab.addGroup("Core levels");
     grp.addRow(new PathDescriptor(ZERO_PATH, "Zero Gamma", C_ZG, 1.0f, null, true, false, true));
     grp.addRow(new PathDescriptor(CALL_PATH, "Call Wall", C_CALL, 1.0f, null, true, false, true));
     grp.addRow(new PathDescriptor(PUT_PATH, "Put Wall", C_PUT, 1.0f, null, true, false, true));
-    grp.addRow(new PathDescriptor(IV68_PATH, "IV Range (68%)", C_IV68, 1.0f, new float[] { 6f, 5f }, true, false, true));
-    grp.addRow(new PathDescriptor(IV80_PATH, "IV Range (80%)", C_IV80, 1.0f, new float[] { 6f, 5f }, true, false, true));
 
-    grp = tab.addGroup("UX / HUD (keep chart clean)");
+    grp = tab.addGroup("HUD");
     grp.addRow(new DiscreteDescriptor(HUD_POS, "HUD Position", "TR", Arrays.asList(
         new NVP("Top Right", "TR"),
         new NVP("Top Left", "TL"),
         new NVP("Bottom Right", "BR"),
         new NVP("Bottom Left", "BL"))));
-    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Quadrant Badge", true));
-    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "Strategy Hint", true));
-    grp.addRow(new BooleanDescriptor(SHOW_HUD, "Compact Info Panel", true));
+    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Regime Badge (+GEX / -GEX)", true));
+    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "Action Plan (what to do)", true));
+    grp.addRow(new BooleanDescriptor(SHOW_OI_DIVERGE, "Vol vs OI Diverge Flag", true));
     grp.addRow(new BooleanDescriptor(SHOW_LEVEL_LABELS, "Level Labels (right)", true));
-    grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE, "Max Change Panel", true));
     grp.addRow(new BooleanDescriptor(SHOW_ERRORS, "Show Errors Only", true));
+
+    grp = tab.addGroup("Optional (off by default)");
+    grp.addRow(new BooleanDescriptor(SHOW_HUD, "Compact Info Panel", false));
+    grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE, "Max Change Panel", false));
+    grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE_LEVELS, "Max Change on Chart", false));
+    grp.addRow(new BooleanDescriptor(SHOW_DUAL_HORIZON, "Overlay opposite period (0DTE↔90D)", false));
+    grp.addRow(new PathDescriptor(CALL_OI_PATH, "Call Wall (OI)", C_CALL_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(PUT_OI_PATH, "Put Wall (OI)", C_PUT_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(IV68_PATH, "IV Range (68%)", C_IV68, 1.0f, new float[] { 6f, 5f }, false, false, true));
+    grp.addRow(new PathDescriptor(IV80_PATH, "IV Range (80%)", C_IV80, 1.0f, new float[] { 6f, 5f }, false, false, true));
+    grp.addRow(new PathDescriptor(MX_PATH, "Max Change Strikes", C_MX, 1.0f, new float[] { 3f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(DUAL_ZERO_PATH, "Dual Zero Gamma", C_DUAL_ZG, 1.0f, new float[] { 8f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(DUAL_CALL_PATH, "Dual Call Wall", C_DUAL_CALL, 1.0f, new float[] { 8f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(DUAL_PUT_PATH, "Dual Put Wall", C_DUAL_PUT, 1.0f, new float[] { 8f, 4f }, false, false, true));
 
     var rd = createRD();
     rd.setLabelSettings(TICKER, FUTURES_TARGET, CATEGORY);
@@ -179,6 +214,8 @@ public class GexbotMajors extends Study
     lastFetchMs = 0;
     lastStatus = "Waiting...";
     lastData = null;
+    lastDualData = null;
+    lastDualCategory = "";
     lastMaxChange = null;
     lastConversion = Conversion.identity();
     lastIv = null;
@@ -190,6 +227,7 @@ public class GexbotMajors extends Study
   public void destroy()
   {
     lastData = null;
+    lastDualData = null;
     lastMaxChange = null;
     latestCtx = null;
   }
@@ -239,8 +277,18 @@ public class GexbotMajors extends Study
         }
 
         MajorsData data = fetchMajors(req);
+        MajorsData dual = null;
+        String dualCat = "";
+        if (getSettings().getBoolean(SHOW_DUAL_HORIZON, false)) {
+          dualCat = dualCategoryFor(req.category);
+          if (!Util.isEmpty(dualCat)) {
+            dual = fetchMajors(req.withCategory(dualCat));
+          }
+        }
+
         MaxChangeData mx = null;
-        if (getSettings().getBoolean(SHOW_MAX_CHANGE, true)) {
+        if (getSettings().getBoolean(SHOW_MAX_CHANGE, false)
+            || getSettings().getBoolean(SHOW_MAX_CHANGE_LEVELS, false)) {
           mx = fetchMaxChange(req);
         }
 
@@ -251,6 +299,8 @@ public class GexbotMajors extends Study
 
         if (data != null) {
           lastData = data;
+          lastDualData = dual;
+          lastDualCategory = dualCat == null ? "" : dualCat;
           lastMaxChange = mx;
           lastSigma1 = computeSigma1(data, lastIv, req.category);
           lastFetchMs = System.currentTimeMillis();
@@ -294,7 +344,11 @@ public class GexbotMajors extends Study
       addLevel(ZERO_PATH, "ZERO GAMMA", convertPrice(data.zeroGamma), C_ZG, false);
       addLevel(CALL_PATH, "CALL WALL", convertPrice(data.mposVol), C_CALL, false);
       addLevel(PUT_PATH, "PUT WALL", convertPrice(data.mnegVol), C_PUT, false);
+      addLevel(CALL_OI_PATH, "CALL OI", convertPrice(data.mposOi), C_CALL_OI, true);
+      addLevel(PUT_OI_PATH, "PUT OI", convertPrice(data.mnegOi), C_PUT_OI, true);
       addIvLevels(data);
+      addDualLevels();
+      addMaxChangeLevels();
       addHud(data);
     }
 
@@ -304,8 +358,8 @@ public class GexbotMajors extends Study
       String pos = trim(getSettings().getString(HUD_POS));
       if (Util.isEmpty(pos)) pos = "TR";
       PanelFigure err = new PanelFigure(lastStatus, C_REGIME_NEG, Color.WHITE, false);
-      // Offset below/above the HUD stack (max 4 rows) so it never overlaps
-      err.setPlacement(8 + 4 * 28, pos.endsWith("R"), pos.startsWith("B"));
+      // Offset below/above the HUD stack (max ~6 rows) so it never overlaps
+      err.setPlacement(8 + 6 * 28, pos.endsWith("R"), pos.startsWith("B"));
       addFigure(err);
     }
 
@@ -320,7 +374,7 @@ public class GexbotMajors extends Study
     boolean right = pos.endsWith("R");
     boolean bottom = pos.startsWith("B");
 
-    // "The 4 Quadrants" cheatsheet: Read the Flip. Know the GEX. Execute the Right Play.
+    // Core HUD: regime + live action plan + optional diverge warning.
     int q = quadrant(data);
     java.util.List<PanelFigure> rows = new java.util.ArrayList<>();
 
@@ -328,25 +382,22 @@ public class GexbotMajors extends Study
       String badge;
       Color bg;
       switch (q) {
-        case 1 -> { badge = "Q1  RANGE BOUND   Above Flip / +GEX"; bg = C_REGIME_POS; }
-        case 2 -> { badge = "Q2  MOVING   Above Flip / -GEX"; bg = C_REGIME_NEG; }
-        case 3 -> { badge = "Q3  INTERACTION   Below Flip / +GEX"; bg = C_REGIME_POS; }
-        default -> { badge = "Q4  TRENDING   Below Flip / -GEX"; bg = C_REGIME_NEG; }
+        case 1 -> { badge = "+GEX  Above Flip  (range)"; bg = C_REGIME_POS; }
+        case 2 -> { badge = "-GEX  Above Flip  (moving)"; bg = C_REGIME_NEG; }
+        case 3 -> { badge = "+GEX  Below Flip  (interaction)"; bg = C_REGIME_POS; }
+        default -> { badge = "-GEX  Below Flip  (trend)"; bg = C_REGIME_NEG; }
       }
       rows.add(new PanelFigure(badge, bg, Color.WHITE, true));
     }
 
     if (getSettings().getBoolean(SHOW_STRATEGY, true)) {
-      String strat = switch (q) {
-        case 1 -> "Fade extremes: buy low, sell high in range. Watch key levels for rejection & bounces.";
-        case 2 -> "Smaller size, wait for confirmation. Let price show strength before you join the move.";
-        case 3 -> "Watch flip closely: bounces & rejections are common. Trade S/R, react fast.";
-        default -> "Play momentum, trade with strength. Tight risk management, let winners run.";
-      };
-      rows.add(new PanelFigure(strat, C_HUD_BG, new Color(235, 235, 235), false));
+      String action = buildActionPlan(data, q);
+      if (!Util.isEmpty(action)) {
+        rows.add(new PanelFigure(action, C_HUD_BG, new Color(235, 235, 235), false));
+      }
     }
 
-    if (getSettings().getBoolean(SHOW_HUD, true)) {
+    if (getSettings().getBoolean(SHOW_HUD, false)) {
       Double zg = convertPrice(data.zeroGamma);
       Double call = convertPrice(data.mposVol);
       Double put = convertPrice(data.mnegVol);
@@ -355,15 +406,21 @@ public class GexbotMajors extends Study
 
       String hud = src
           + "   Spot " + formatPrice(spotFx)
-          + "   |  Ceiling " + formatPrice(call)
+          + "   |  Call " + formatPrice(call)
           + "   Flip " + formatPrice(zg) + distToZg(spotFx, zg)
-          + "   Floor " + formatPrice(put)
-          + "   |  Net " + formatSigned(data.netGexVol)
-          + ivHudSuffix(data);
+          + "   Put " + formatPrice(put)
+          + "   |  Net " + formatSigned(data.netGexVol);
       rows.add(new PanelFigure(hud, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
-    if (getSettings().getBoolean(SHOW_MAX_CHANGE, true) && lastMaxChange != null) {
+    if (getSettings().getBoolean(SHOW_OI_DIVERGE, true)) {
+      String diverge = oiDivergeLine(data);
+      if (!Util.isEmpty(diverge)) {
+        rows.add(new PanelFigure(diverge, C_WARN, Color.WHITE, true));
+      }
+    }
+
+    if (getSettings().getBoolean(SHOW_MAX_CHANGE, false) && lastMaxChange != null) {
       String mx = buildMaxChangeOneLine(lastMaxChange);
       if (!Util.isEmpty(mx)) {
         rows.add(new PanelFigure(mx, new Color(25, 25, 35), new Color(210, 210, 220), false));
@@ -371,6 +428,154 @@ public class GexbotMajors extends Study
     }
 
     placeRows(rows, right, bottom);
+  }
+
+  /**
+   * One-line playbook from regime + distance to Call / Flip / Put + OI diverge.
+   * Not a signal — a bias reminder for discretionary trading.
+   */
+  private String buildActionPlan(MajorsData data, int q)
+  {
+    if (data == null || data.spot == null) return "ACTION: Waiting for spot...";
+
+    Double spot = data.spot;
+    Double call = data.mposVol;
+    Double put = data.mnegVol;
+    Double flip = data.zeroGamma;
+
+    boolean nearCall = nearLevel(spot, call, put, call);
+    boolean nearPut = nearLevel(spot, call, put, put);
+    boolean nearFlip = nearLevel(spot, call, put, flip);
+    boolean callDiv = diverges(data.mposVol, data.mposOi);
+    boolean putDiv = diverges(data.mnegVol, data.mnegOi);
+    boolean diverge = callDiv || putDiv;
+
+    String base;
+    if (nearCall && !nearPut) {
+      base = switch (q) {
+        case 1 -> "ACTION: Near Call Wall — fade/sell strength. Target Flip. Do not chase longs.";
+        case 2 -> "ACTION: Near Call in -GEX — prefer short on rejection. Size down; Flip may fail.";
+        case 3 -> "ACTION: Near Call below Flip — treat as resistance. Fade only with clear rejection.";
+        default -> "ACTION: Near Call in -GEX trend — sell rallies. Trail if momentum holds.";
+      };
+    }
+    else if (nearPut && !nearCall) {
+      base = switch (q) {
+        case 1 -> "ACTION: Near Put Wall — buy dips. Target mid-range / Flip. Stop under Put.";
+        case 2 -> "ACTION: Near Put in -GEX — bounce possible but fragile. Small size or wait.";
+        case 3 -> "ACTION: Near Put below Flip — look for bounce into Flip. Confirm with price.";
+        default -> "ACTION: Near Put in -GEX trend — counter-trend only. Prefer wait for Flip reclaim.";
+      };
+    }
+    else if (nearFlip) {
+      base = switch (q) {
+        case 1, 2 -> "ACTION: At Flip from above — watch for hold (support) or break (regime shift).";
+        default -> "ACTION: At Flip from below — reclaim = long bias; fail = stay short / wait.";
+      };
+    }
+    else {
+      base = switch (q) {
+        case 1 -> "ACTION: Mid-range +GEX — wait for extremes. Sell Call / buy Put; avoid mid entries.";
+        case 2 -> "ACTION: Mid-range -GEX — reduce size. Wait for direction vs Flip or Call/Put.";
+        case 3 -> "ACTION: Below Flip +GEX — trade Flip as magnet. Expect chop; react to tests.";
+        default -> "ACTION: Below Flip -GEX — momentum short bias. Sell strength toward Flip.";
+      };
+    }
+
+    if (diverge) {
+      if (callDiv && putDiv) base += "  Walls Vol!=OI — confirm levels with price.";
+      else if (callDiv) base += "  Call Vol!=OI — Call Wall less reliable.";
+      else base += "  Put Vol!=OI — Put Wall less reliable.";
+    }
+    return base;
+  }
+
+  /** True if spot is near {@code level} relative to Call–Put span (or spot %). */
+  private static boolean nearLevel(Double spot, Double call, Double put, Double level)
+  {
+    if (spot == null || level == null) return false;
+    double dist = Math.abs(spot - level);
+    double span = 0;
+    if (call != null && put != null) span = Math.abs(call - put);
+    double thresh;
+    if (span > 1) thresh = Math.max(span * NEAR_FRAC, Math.abs(spot) * NEAR_SPOT_FRAC * 0.25);
+    else thresh = Math.abs(spot) * NEAR_SPOT_FRAC;
+    return dist <= thresh;
+  }
+
+  private void addDualLevels()
+  {
+    if (!getSettings().getBoolean(SHOW_DUAL_HORIZON, false)) return;
+    MajorsData dual = lastDualData;
+    if (dual == null) return;
+    String tag = shortCat(lastDualCategory);
+    addLevel(DUAL_ZERO_PATH, "ZG " + tag, convertPrice(dual.zeroGamma), C_DUAL_ZG, true);
+    addLevel(DUAL_CALL_PATH, "CALL " + tag, convertPrice(dual.mposVol), C_DUAL_CALL, true);
+    addLevel(DUAL_PUT_PATH, "PUT " + tag, convertPrice(dual.mnegVol), C_DUAL_PUT, true);
+  }
+
+  private void addMaxChangeLevels()
+  {
+    if (!getSettings().getBoolean(SHOW_MAX_CHANGE_LEVELS, false)) return;
+    MaxChangeData mx = lastMaxChange;
+    if (mx == null) return;
+    addMxLevel("now", mx.current);
+    addMxLevel("1m", mx.one);
+    addMxLevel("5m", mx.five);
+    addMxLevel("10m", mx.ten);
+    addMxLevel("15m", mx.fifteen);
+    addMxLevel("30m", mx.thirty);
+  }
+
+  private void addMxLevel(String tf, double[] pair)
+  {
+    if (pair == null || pair.length < 1) return;
+    addLevel(MX_PATH, "dGEX " + tf, convertPrice(pair[0]), C_MX, true);
+  }
+
+  private static String shortCat(String category)
+  {
+    if (Util.isEmpty(category)) return "";
+    String c = category.toLowerCase();
+    if (c.contains("zero")) return "0D";
+    if (c.contains("one")) return "1D";
+    if (c.contains("full")) return "90D";
+    return category;
+  }
+
+  /** Opposite structural period for overlay: 0DTE↔90D, 1DTE→90D. */
+  private static String dualCategoryFor(String category)
+  {
+    if (Util.isEmpty(category)) return "gex_full";
+    String c = category.toLowerCase();
+    if (c.contains("zero")) return "gex_full";
+    if (c.contains("full")) return "gex_zero";
+    if (c.contains("one")) return "gex_full";
+    return "gex_full";
+  }
+
+  private String oiDivergeLine(MajorsData data)
+  {
+    if (data == null) return null;
+    boolean callDiv = diverges(data.mposVol, data.mposOi);
+    boolean putDiv = diverges(data.mnegVol, data.mnegOi);
+    if (!callDiv && !putDiv) return null;
+    StringBuilder sb = new StringBuilder("DIVERGE Vol!=OI");
+    if (callDiv) {
+      sb.append("  Call ").append(formatPrice(convertPrice(data.mposVol)))
+          .append(" vs ").append(formatPrice(convertPrice(data.mposOi)));
+    }
+    if (putDiv) {
+      sb.append("  Put ").append(formatPrice(convertPrice(data.mnegVol)))
+          .append(" vs ").append(formatPrice(convertPrice(data.mnegOi)));
+    }
+    return sb.toString();
+  }
+
+  private static boolean diverges(Double vol, Double oi)
+  {
+    if (vol == null || oi == null) return false;
+    return Math.abs(vol - oi) >= OI_DIVERGE_PTS;
   }
 
   /** Stack HUD panels in the chosen chart corner (badge always on top). */
@@ -401,8 +606,10 @@ public class GexbotMajors extends Study
   private String buildMaxChangeOneLine(MaxChangeData mx)
   {
     StringBuilder sb = new StringBuilder("MAX dGEX");
+    appendMxInline(sb, "now", mx.current);
     appendMxInline(sb, "1m", mx.one);
     appendMxInline(sb, "5m", mx.five);
+    appendMxInline(sb, "10m", mx.ten);
     appendMxInline(sb, "15m", mx.fifteen);
     appendMxInline(sb, "30m", mx.thirty);
     return sb.toString();
@@ -842,7 +1049,7 @@ public class GexbotMajors extends Study
     conn.setConnectTimeout(10000);
     conn.setReadTimeout(15000);
     conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-    conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.3");
+    conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.4");
     conn.setRequestProperty("Accept", "application/json");
     return conn;
   }
@@ -921,6 +1128,11 @@ public class GexbotMajors extends Study
       this.futuresTarget = futuresTarget;
       this.category = category;
     }
+
+    ResolvedRequest withCategory(String cat)
+    {
+      return new ResolvedRequest(apiKey, ticker, futuresTarget, cat);
+    }
   }
 
   static class Conversion
@@ -936,7 +1148,7 @@ public class GexbotMajors extends Study
 
   static class MajorsData
   {
-    Double zeroGamma, mposVol, mnegVol, spot, netGexVol, netGexOi;
+    Double zeroGamma, mposVol, mnegVol, mposOi, mnegOi, spot, netGexVol, netGexOi;
 
     static MajorsData parse(String json)
     {
@@ -945,10 +1157,13 @@ public class GexbotMajors extends Study
       d.zeroGamma = readNumber(json, "zero_gamma");
       d.mposVol = readNumber(json, "mpos_vol");
       d.mnegVol = readNumber(json, "mneg_vol");
+      d.mposOi = readNumber(json, "mpos_oi");
+      d.mnegOi = readNumber(json, "mneg_oi");
       d.spot = readNumber(json, "spot");
       d.netGexVol = readNumber(json, "net_gex_vol");
       d.netGexOi = readNumber(json, "net_gex_oi");
-      if (d.zeroGamma == null && d.mposVol == null && d.mnegVol == null) return null;
+      if (d.zeroGamma == null && d.mposVol == null && d.mnegVol == null
+          && d.mposOi == null && d.mnegOi == null) return null;
       return d;
     }
 
@@ -976,17 +1191,21 @@ public class GexbotMajors extends Study
 
   static class MaxChangeData
   {
-    double[] one, five, fifteen, thirty;
+    double[] current, one, five, ten, fifteen, thirty;
 
     static MaxChangeData parse(String json)
     {
       if (Util.isEmpty(json)) return null;
       MaxChangeData d = new MaxChangeData();
+      d.current = readPair(json, "current");
+      if (d.current == null) d.current = readPair(json, "now");
       d.one = readPair(json, "one");
       d.five = readPair(json, "five");
+      d.ten = readPair(json, "ten");
       d.fifteen = readPair(json, "fifteen");
       d.thirty = readPair(json, "thirty");
-      if (d.one == null && d.five == null && d.fifteen == null && d.thirty == null) return null;
+      if (d.current == null && d.one == null && d.five == null
+          && d.ten == null && d.fifteen == null && d.thirty == null) return null;
       return d;
     }
 

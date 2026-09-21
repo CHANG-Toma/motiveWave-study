@@ -13,6 +13,9 @@ $jdkHomeFile = Join-Path $buildDir "jdk_home.txt"
 $candidates = @()
 if (Test-Path $jdkHomeFile) { $candidates += (Get-Content $jdkHomeFile -Raw).Trim() }
 $candidates += @(
+  "C:\Users\CHANG Toma\.jdks\jdk-26",
+  "C:\Users\CHANG Toma\.jdks\openjdk-19.0.2",
+  "C:\Users\CHANG Toma\.jdks\openjdk-17",
   "C:\Users\hauat\Java\jdk-27",
   "C:\Program Files\Java\jdk-27",
   "C:\Program Files\Java\jdk-26",
@@ -26,7 +29,7 @@ if ($jdkHome) {
   $env:Path = "$jdkHome\bin;" + $env:Path
   Write-Host "Using JDK: $jdkHome"
 } else {
-  Write-Host "WARNING: no JDK 25+ found, using default java on PATH"
+  Write-Host "WARNING: no JDK found, using default java on PATH"
 }
 
 Write-Host "Project: $projectRoot"
@@ -45,6 +48,7 @@ $sources = @(Get-ChildItem -Path $srcDir -Recurse -Filter "*.java" |
 if ($sources.Count -lt 1) { throw "No gexbot java sources found" }
 Write-Host "Compiling $($sources.Count) files..."
 
+# mwave_sdk.jar is Java 26 bytecode; compile with matching release.
 & javac -encoding UTF-8 -g --release 26 -cp $sdk -d $classesDir @sources
 if ($LASTEXITCODE -ne 0) { throw "Compilation failed" }
 
