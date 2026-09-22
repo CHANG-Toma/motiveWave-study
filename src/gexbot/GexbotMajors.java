@@ -55,7 +55,7 @@ import com.motivewave.platform.sdk.study.StudyHeader;
     id = "GEXBOT_MAJORS",
     name = "Gexbot Majors (Custom)",
     label = "Gexbot Majors",
-    desc = "Call/Put/Zero Gamma levels + regime badge + live action plan. Requires a Custom API key.",
+    desc = "Call/Put/Zero Gamma + regime + LAF/LBF setup checklist. Requires a Custom API key.",
     menu = "Gexbot",
     overlay = true,
     studyOverlay = true)
@@ -85,6 +85,8 @@ public class GexbotMajors extends Study
   static final String SHOW_HUD = "showHud";
   static final String SHOW_REGIME = "showRegime";
   static final String SHOW_STRATEGY = "showStrategy";
+  static final String SHOW_CHECKLIST = "showChecklist";
+  static final String SHOW_ALIGNED = "showAligned";
   static final String SHOW_LEVEL_LABELS = "showLevelLabels";
   static final String SHOW_MAX_CHANGE = "showMaxChange";
   static final String SHOW_MAX_CHANGE_LEVELS = "showMaxChangeLevels";
@@ -111,6 +113,10 @@ public class GexbotMajors extends Study
   static final Color C_REGIME_NEG = new Color(170, 35, 35);
   static final Color C_REGIME_POS = new Color(25, 120, 65);
   static final Color C_WARN = new Color(180, 120, 30);
+  static final Color C_SETUP = new Color(30, 60, 100);
+  static final Color C_SETUP_GO = new Color(20, 90, 55);
+  static final Color C_SETUP_WAIT = new Color(180, 120, 30);
+  static final Color C_SETUP_NO = new Color(170, 35, 35);
   /** Normal z for a two-tailed 80% interval. 68% uses 1σ. */
   static final double Z_80 = 1.2815515655446004;
   /** Strikes farther than this (source units) count as Vol vs OI divergence. */
@@ -118,6 +124,10 @@ public class GexbotMajors extends Study
   /** Near a wall when within this fraction of the Call–Put range (fallback: 0.35% of spot). */
   static final double NEAR_FRAC = 0.12;
   static final double NEAR_SPOT_FRAC = 0.0035;
+  static final Color C_ALIGNED = new Color(0, 140, 70);
+  static final Color C_ALMOST = new Color(200, 140, 20);
+  /** Bars to scan for sweep + reclaim (LAF/LBF candle confirmation). */
+  static final int RECLAIM_LOOKBACK = 16;
 
   private final AtomicBoolean fetching = new AtomicBoolean(false);
   private volatile MajorsData lastData;
@@ -185,7 +195,9 @@ public class GexbotMajors extends Study
         new NVP("Bottom Right", "BR"),
         new NVP("Bottom Left", "BL"))));
     grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Regime Badge (+GEX / -GEX)", true));
-    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "Action Plan (what to do)", true));
+    grp.addRow(new BooleanDescriptor(SHOW_ALIGNED, "ALIGNED / ALMOST Banner", true));
+    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "LAF/LBF Setup Plan", true));
+    grp.addRow(new BooleanDescriptor(SHOW_CHECKLIST, "LAF/LBF Checklist Line", false));
     grp.addRow(new BooleanDescriptor(SHOW_OI_DIVERGE, "Vol vs OI Diverge Flag", true));
     grp.addRow(new BooleanDescriptor(SHOW_LEVEL_LABELS, "Level Labels (right)", true));
     grp.addRow(new BooleanDescriptor(SHOW_ERRORS, "Show Errors Only", true));
@@ -349,7 +361,7 @@ public class GexbotMajors extends Study
       addIvLevels(data);
       addDualLevels();
       addMaxChangeLevels();
-      addHud(data);
+      addHud(data, ctx);
     }
 
     if (getSettings().getBoolean(SHOW_ERRORS, true)
@@ -359,7 +371,7 @@ public class GexbotMajors extends Study
       if (Util.isEmpty(pos)) pos = "TR";
       PanelFigure err = new PanelFigure(lastStatus, C_REGIME_NEG, Color.WHITE, false);
       // Offset below/above the HUD stack (max ~6 rows) so it never overlaps
-      err.setPlacement(8 + 6 * 28, pos.endsWith("R"), pos.startsWith("B"));
+      err.setPlacement(8 + 8 * 28, pos.endsWith("R"), pos.startsWith("B"));
       addFigure(err);
     }
 
@@ -367,14 +379,14 @@ public class GexbotMajors extends Study
     notifyRedraw();
   }
 
-  private void addHud(MajorsData data)
+  private void addHud(MajorsData data, DataContext ctx)
   {
     String pos = trim(getSettings().getString(HUD_POS));
     if (Util.isEmpty(pos)) pos = "TR";
     boolean right = pos.endsWith("R");
     boolean bottom = pos.startsWith("B");
 
-    // Core HUD: regime + live action plan + optional diverge warning.
+    // Core HUD: regime + ALIGNED banner + LAF/LBF setup + optional diverge.
     int q = quadrant(data);
     java.util.List<PanelFigure> rows = new java.util.ArrayList<>();
 
@@ -390,11 +402,24 @@ public class GexbotMajors extends Study
       rows.add(new PanelFigure(badge, bg, Color.WHITE, true));
     }
 
-    if (getSettings().getBoolean(SHOW_STRATEGY, true)) {
-      String action = buildActionPlan(data, q);
-      if (!Util.isEmpty(action)) {
-        rows.add(new PanelFigure(action, C_HUD_BG, new Color(235, 235, 235), false));
-      }
+    SetupPlan plan = buildSetupPlan(data, q, ctx);
+
+    // Compact HUD: never stack conflicting banners. Max useful rows.
+    boolean brokeNoTrade = plan.noTrade;
+    if (getSettings().getBoolean(SHOW_ALIGNED, true) && !Util.isEmpty(plan.align) && !brokeNoTrade) {
+      rows.add(new PanelFigure(plan.align, plan.alignBg, Color.WHITE, true));
+    }
+    // When ALIGNED, skip redundant SETUP (banner is enough). When BROKE, show only NO TRADE.
+    boolean showSetup = getSettings().getBoolean(SHOW_STRATEGY, true) && !Util.isEmpty(plan.setup);
+    if (showSetup && Util.isEmpty(plan.align)) {
+      rows.add(new PanelFigure(plan.setup, plan.setupBg, plan.setupFg, true));
+    }
+    else if (showSetup && brokeNoTrade) {
+      rows.add(new PanelFigure(plan.setup, plan.setupBg, plan.setupFg, true));
+    }
+    if (getSettings().getBoolean(SHOW_CHECKLIST, false) && !Util.isEmpty(plan.checklist) && !brokeNoTrade
+        && !Util.isEmpty(plan.align)) {
+      rows.add(new PanelFigure(plan.checklist, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
     if (getSettings().getBoolean(SHOW_HUD, false)) {
@@ -413,9 +438,10 @@ public class GexbotMajors extends Study
       rows.add(new PanelFigure(hud, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
+    // Diverge only when relevant to active setup (not always — less clutter)
     if (getSettings().getBoolean(SHOW_OI_DIVERGE, true)) {
       String diverge = oiDivergeLine(data);
-      if (!Util.isEmpty(diverge)) {
+      if (!Util.isEmpty(diverge) && (brokeNoTrade || !Util.isEmpty(plan.align) || plan.setup != null && plan.setup.contains("candidate"))) {
         rows.add(new PanelFigure(diverge, C_WARN, Color.WHITE, true));
       }
     }
@@ -431,76 +457,340 @@ public class GexbotMajors extends Study
   }
 
   /**
-   * One-line playbook from regime + distance to Call / Flip / Put + OI diverge.
-   * Not a signal — a bias reminder for discretionary trading.
+   * Maps GEX walls + regime to LAF/LBF playbook, and flags ALIGNED when
+   * GEX + wall side + candle sweep/reclaim all line up.
+   * Order-flow ABS still confirmed on your tape (study cannot see delta bubbles).
    */
-  private String buildActionPlan(MajorsData data, int q)
+  private SetupPlan buildSetupPlan(MajorsData data, int q, DataContext ctx)
   {
-    if (data == null || data.spot == null) return "ACTION: Waiting for spot...";
+    if (data == null || data.spot == null) {
+      return SetupPlan.of(null, "SETUP: Waiting...", null, C_HUD_BG, new Color(235, 235, 235), C_ALIGNED, false);
+    }
 
     Double spot = data.spot;
     Double call = data.mposVol;
     Double put = data.mnegVol;
     Double flip = data.zeroGamma;
+    double band = levelBand(spot, call, put);
 
-    boolean nearCall = nearLevel(spot, call, put, call);
-    boolean nearPut = nearLevel(spot, call, put, put);
-    boolean nearFlip = nearLevel(spot, call, put, flip);
+    int callSide = wallSide(spot, call, band);
+    int putSide = wallSide(spot, put, band);
+    int flipSide = wallSide(spot, flip, band);
+
     boolean callDiv = diverges(data.mposVol, data.mposOi);
     boolean putDiv = diverges(data.mnegVol, data.mnegOi);
-    boolean diverge = callDiv || putDiv;
+    boolean nearCall = call != null && nearLevel(spot, call, put, call);
+    boolean nearPut = put != null && nearLevel(spot, call, put, put);
+    boolean nearFlip = flip != null && nearLevel(spot, call, put, flip);
 
-    String base;
-    if (nearCall && !nearPut) {
-      base = switch (q) {
-        case 1 -> "ACTION: Near Call Wall — fade/sell strength. Target Flip. Do not chase longs.";
-        case 2 -> "ACTION: Near Call in -GEX — prefer short on rejection. Size down; Flip may fail.";
-        case 3 -> "ACTION: Near Call below Flip — treat as resistance. Fade only with clear rejection.";
-        default -> "ACTION: Near Call in -GEX trend — sell rallies. Trail if momentum holds.";
-      };
+    boolean fadeFriendly = (q == 1 || q == 3);
+    boolean momentumBias = (q == 4 || q == 2);
+
+    Double callFx = convertPrice(call);
+    Double putFx = convertPrice(put);
+    Double flipFx = convertPrice(flip);
+    double edge = Math.max(band * 0.25, (callFx != null ? Math.abs(callFx) : 1) * 0.00012);
+
+    boolean lafReclaim = detectLafReclaim(ctx, callFx, edge);
+    boolean lbfReclaim = detectLbfReclaim(ctx, putFx, edge);
+    boolean flipLbfReclaim = detectLbfReclaim(ctx, flipFx, edge);
+    boolean flipLafReclaim = detectLafReclaim(ctx, flipFx, edge);
+
+    String setup;
+    String need;
+    Color bg;
+    Color fg = Color.WHITE;
+    int score;
+    String kind = "—";
+    boolean entryReady = false; // candle reclaim confirmed + still valid side
+    boolean gexReady = false;   // right wall + fade-friendly enough
+    boolean noTrade = false;
+
+    // --- CALL WALL → LAF short ---
+    if (call != null && callSide > 0) {
+      // Still ABOVE Call: NEVER ALIGNED for short (contradiction is dangerous).
+      kind = "LAF";
+      score = confluenceScore(q, true, callDiv, fadeFriendly);
+      setup = "NO TRADE - BROKE Call " + formatPrice(callFx) + "  |  wait close BELOW then LAF";
+      need = null;
+      bg = C_SETUP_NO;
+      entryReady = false;
+      gexReady = false;
+      noTrade = true;
     }
-    else if (nearPut && !nearCall) {
-      base = switch (q) {
-        case 1 -> "ACTION: Near Put Wall — buy dips. Target mid-range / Flip. Stop under Put.";
-        case 2 -> "ACTION: Near Put in -GEX — bounce possible but fragile. Small size or wait.";
-        case 3 -> "ACTION: Near Put below Flip — look for bounce into Flip. Confirm with price.";
-        default -> "ACTION: Near Put in -GEX trend — counter-trend only. Prefer wait for Flip reclaim.";
-      };
+    else if (call != null && callSide == 0 && putSide >= 0) {
+      kind = "LAF";
+      score = confluenceScore(q, false, callDiv, fadeFriendly);
+      gexReady = fadeFriendly && score >= 2 && !callDiv;
+      entryReady = false; // testing Call: not aligned until close below
+      if (momentumBias && q == 4) {
+        setup = "SETUP: Testing Call " + formatPrice(callFx)
+            + " — Q4: LAF only if reclaim confirmed.  " + confluenceLabel(kind, q, score);
+        bg = C_SETUP_WAIT;
+      }
+      else {
+        setup = "SETUP: LAF candidate @ Call " + formatPrice(callFx)
+            + " — short ONLY after lose Call.  " + confluenceLabel(kind, q, score);
+        bg = fadeFriendly ? C_SETUP_GO : C_SETUP_WAIT;
+      }
+      need = "NEED LAF (tick all 5): VP · swept ABOVE Call · aggressive buys · BUY ABS · close BELOW Call. Else PASS.";
     }
-    else if (nearFlip) {
-      base = switch (q) {
-        case 1, 2 -> "ACTION: At Flip from above — watch for hold (support) or break (regime shift).";
-        default -> "ACTION: At Flip from below — reclaim = long bias; fail = stay short / wait.";
-      };
+    else if (call != null && callSide < 0 && nearCall && putSide > 0) {
+      kind = "LAF";
+      score = confluenceScore(q, false, callDiv, fadeFriendly);
+      gexReady = fadeFriendly && score >= 2 && !callDiv;
+      entryReady = lafReclaim && callSide < 0;
+      setup = "SETUP: Approaching Call " + formatPrice(callFx)
+          + " — prepare LAF short. Do not pre-short.  " + confluenceLabel(kind, q, score);
+      need = "NEED LAF: wait sweep above Call → BUY ABS → close below Call. Target Flip "
+          + formatPrice(flipFx);
+      bg = C_SETUP;
+      fg = new Color(235, 235, 235);
+    }
+    // --- PUT WALL → LBF long ---
+    else if (put != null && putSide < 0) {
+      kind = "LBF";
+      score = confluenceScore(q, true, putDiv, fadeFriendly);
+      setup = "NO TRADE - BROKE Put " + formatPrice(putFx) + "  |  wait close ABOVE then LBF";
+      need = null;
+      bg = C_SETUP_NO;
+      entryReady = false;
+      gexReady = false;
+      noTrade = true;
+    }
+    else if (put != null && putSide == 0 && callSide <= 0) {
+      kind = "LBF";
+      score = confluenceScore(q, false, putDiv, fadeFriendly);
+      gexReady = fadeFriendly && score >= 2 && !putDiv;
+      entryReady = false; // testing Put: not aligned until close above
+      if (momentumBias && q == 4) {
+        setup = "SETUP: Testing Put " + formatPrice(putFx)
+            + " — Q4: LBF only if reclaim confirmed.  " + confluenceLabel(kind, q, score);
+        bg = C_SETUP_WAIT;
+      }
+      else {
+        setup = "SETUP: LBF candidate @ Put " + formatPrice(putFx)
+            + " — long ONLY after reclaim Put.  " + confluenceLabel(kind, q, score);
+        bg = fadeFriendly ? C_SETUP_GO : C_SETUP_WAIT;
+      }
+      need = "NEED LBF (tick all 5): VP · swept BELOW Put · aggressive sells · SELL ABS · close ABOVE Put. Else PASS.";
+    }
+    else if (put != null && putSide > 0 && nearPut && callSide < 0) {
+      kind = "LBF";
+      score = confluenceScore(q, false, putDiv, fadeFriendly);
+      gexReady = fadeFriendly && score >= 2 && !putDiv;
+      entryReady = lbfReclaim && putSide > 0;
+      setup = "SETUP: Approaching Put " + formatPrice(putFx)
+          + " — prepare LBF long. Do not pre-buy.  " + confluenceLabel(kind, q, score);
+      need = "NEED LBF: wait sweep below Put → SELL ABS → close above Put. Target Flip "
+          + formatPrice(flipFx);
+      bg = C_SETUP;
+      fg = new Color(235, 235, 235);
+    }
+    // --- FLIP ---
+    else if (flip != null && (flipSide == 0 || nearFlip)) {
+      score = fadeFriendly ? 2 : 0;
+      if (spot >= flip) {
+        kind = "LBF";
+        gexReady = fadeFriendly;
+        entryReady = flipLbfReclaim;
+        setup = "SETUP: At Flip from above — LBF if swept below Flip & reclaim.  "
+            + confluenceLabel(kind, q, score);
+        need = "NEED: sweep BELOW Flip · SELL ABS · close ABOVE Flip → long.";
+      }
+      else {
+        kind = "LAF";
+        gexReady = fadeFriendly;
+        entryReady = flipLafReclaim;
+        setup = "SETUP: At Flip from below — LAF if swept above Flip & lose.  "
+            + confluenceLabel(kind, q, score);
+        need = "NEED: sweep ABOVE Flip · BUY ABS · close BELOW Flip → short.";
+      }
+      bg = C_SETUP_WAIT;
+    }
+    else if (q == 4) {
+      score = -2;
+      setup = "SETUP: Mid-range Q4 TRENDING -GEX — momentum > fade.  Confluence LOW";
+      need = "NEED: wait Call/Put/Flip test. LAF/LBF only with full checklist.";
+      bg = C_SETUP_WAIT;
+    }
+    else if (q == 2) {
+      score = 0;
+      setup = "SETUP: Mid-range Q2 MOVING -GEX — size down.  Confluence LOW";
+      need = "NEED: no mid entries. At wall use LAF/LBF checklist.";
+      bg = C_SETUP_WAIT;
+    }
+    else if (q == 3) {
+      score = 2;
+      setup = "SETUP: Mid below Flip +GEX — Flip magnet. Wait for test.  Confluence MED";
+      need = "NEED: LAF @ Call / LBF @ Put / Flip reclaim only. Tick all 5 or PASS.";
+      bg = C_SETUP;
+      fg = new Color(235, 235, 235);
     }
     else {
-      base = switch (q) {
-        case 1 -> "ACTION: Mid-range +GEX — wait for extremes. Sell Call / buy Put; avoid mid entries.";
-        case 2 -> "ACTION: Mid-range -GEX — reduce size. Wait for direction vs Flip or Call/Put.";
-        case 3 -> "ACTION: Below Flip +GEX — trade Flip as magnet. Expect chop; react to tests.";
-        default -> "ACTION: Below Flip -GEX — momentum short bias. Sell strength toward Flip.";
-      };
+      score = 1;
+      setup = "SETUP: Mid-range Q1 +GEX — wait extremes.  Confluence IDLE";
+      need = "NEED: no mid entries. Prepare LAF @ Call or LBF @ Put.";
+      bg = C_SETUP;
+      fg = new Color(235, 235, 235);
     }
 
-    if (diverge) {
-      if (callDiv && putDiv) base += "  Walls Vol!=OI — confirm levels with price.";
-      else if (callDiv) base += "  Call Vol!=OI — Call Wall less reliable.";
-      else base += "  Put Vol!=OI — Put Wall less reliable.";
+    if (!noTrade) {
+      if (callDiv && putDiv) setup += "  Walls Vol!=OI";
+      else if (callDiv) setup += "  Call Vol!=OI";
+      else if (putDiv) setup += "  Put Vol!=OI";
     }
-    return base;
+
+    // --- ALIGNED banner ---
+    String align = null;
+    Color alignBg = C_ALIGNED;
+    boolean wallOk = ("LAF".equals(kind) && !callDiv) || ("LBF".equals(kind) && !putDiv);
+
+    // Hard rule: never ALIGNED during BROKE / NO TRADE
+    if (!noTrade && entryReady && gexReady && wallOk
+        && (("LAF".equals(kind) && lastCloseBelow(ctx, callFx, edge))
+            || ("LBF".equals(kind) && lastCloseAbove(ctx, putFx, edge)))) {
+      if ("LAF".equals(kind)) {
+        align = "ALIGNED - LAF SHORT  |  below Call + reclaim OK  |  confirm BUY ABS";
+      }
+      else if ("LBF".equals(kind)) {
+        align = "ALIGNED - LBF LONG  |  above Put + reclaim OK  |  confirm SELL ABS";
+      }
+      alignBg = C_ALIGNED;
+    }
+    else if (!noTrade && gexReady && wallOk && ("LAF".equals(kind) || "LBF".equals(kind))) {
+      align = "ALMOST - " + kind + " GEX OK  |  waiting reclaim close";
+      alignBg = C_ALMOST;
+    }
+
+    return SetupPlan.of(align, setup, need, bg, fg, alignBg, noTrade);
+  }
+
+  private static boolean lastCloseBelow(DataContext ctx, Double levelFx, double edge)
+  {
+    if (ctx == null || levelFx == null) return false;
+    var series = ctx.getDataSeries();
+    if (series == null || series.size() < 1) return false;
+    return series.getClose(series.size() - 1) < levelFx - edge;
+  }
+
+  private static boolean lastCloseAbove(DataContext ctx, Double levelFx, double edge)
+  {
+    if (ctx == null || levelFx == null) return false;
+    var series = ctx.getDataSeries();
+    if (series == null || series.size() < 1) return false;
+    return series.getClose(series.size() - 1) > levelFx + edge;
+  }
+
+  /** LAF: recent high swept above level, then a close back below. */
+  private static boolean detectLafReclaim(DataContext ctx, Double levelFx, double edge)
+  {
+    if (ctx == null || levelFx == null) return false;
+    var series = ctx.getDataSeries();
+    if (series == null || series.size() < 3) return false;
+    int n = series.size();
+    int from = Math.max(0, n - RECLAIM_LOOKBACK);
+    boolean swept = false;
+    for (int i = from; i < n; i++) {
+      if (series.getHigh(i) > levelFx + edge) swept = true;
+      if (swept && series.getClose(i) < levelFx - edge) return true;
+    }
+    return false;
+  }
+
+  /** LBF: recent low swept below level, then a close back above. */
+  private static boolean detectLbfReclaim(DataContext ctx, Double levelFx, double edge)
+  {
+    if (ctx == null || levelFx == null) return false;
+    var series = ctx.getDataSeries();
+    if (series == null || series.size() < 3) return false;
+    int n = series.size();
+    int from = Math.max(0, n - RECLAIM_LOOKBACK);
+    boolean swept = false;
+    for (int i = from; i < n; i++) {
+      if (series.getLow(i) < levelFx - edge) swept = true;
+      if (swept && series.getClose(i) > levelFx + edge) return true;
+    }
+    return false;
+  }
+
+  private static int confluenceScore(int q, boolean alreadyBroke, boolean wallDiv, boolean fadeFriendly)
+  {
+    int score = 0;
+    if (fadeFriendly) score += 2;
+    if (q == 1) score += 1;
+    if (q == 4) score -= 2;
+    if (q == 2) score -= 1;
+    if (alreadyBroke) score -= 1;
+    if (wallDiv) score -= 1;
+    return score;
+  }
+
+  private static String confluenceLabel(String kind, int q, int score)
+  {
+    String tier = score >= 3 ? "HIGH" : (score >= 1 ? "MED" : "LOW");
+    return "Confluence " + tier + " (" + kind + "/Q" + q + ")";
+  }
+
+  /** Kept for any leftover call sites. */
+  private static String confluence(String kind, int q, boolean alreadyBroke, boolean wallDiv, boolean fadeFriendly)
+  {
+    return confluenceLabel(kind, q, confluenceScore(q, alreadyBroke, wallDiv, fadeFriendly));
+  }
+
+  static final class SetupPlan
+  {
+    final String align;
+    final String setup;
+    final String checklist;
+    final Color setupBg;
+    final Color setupFg;
+    final Color alignBg;
+    final boolean noTrade;
+
+    SetupPlan(String align, String setup, String checklist, Color setupBg, Color setupFg, Color alignBg, boolean noTrade)
+    {
+      this.align = align;
+      this.setup = setup;
+      this.checklist = checklist;
+      this.setupBg = setupBg;
+      this.setupFg = setupFg;
+      this.alignBg = alignBg;
+      this.noTrade = noTrade;
+    }
+
+    static SetupPlan of(String align, String setup, String checklist, Color bg, Color fg, Color alignBg, boolean noTrade)
+    {
+      return new SetupPlan(align, setup, checklist, bg, fg, alignBg, noTrade);
+    }
+  }
+
+  /**
+   * Which side of a wall: -1 below, 0 testing (within band), +1 above (broke).
+   * Band is half the "near" threshold so "broke" triggers as soon as price clears the wall.
+   */
+  private static int wallSide(Double spot, Double level, double band)
+  {
+    if (spot == null || level == null) return 0;
+    double edge = Math.max(band * 0.35, Math.abs(level) * 0.00015);
+    if (spot > level + edge) return 1;
+    if (spot < level - edge) return -1;
+    return 0;
+  }
+
+  private static double levelBand(Double spot, Double call, Double put)
+  {
+    double span = 0;
+    if (call != null && put != null) span = Math.abs(call - put);
+    if (span > 1) return Math.max(span * NEAR_FRAC, Math.abs(spot == null ? 0 : spot) * NEAR_SPOT_FRAC * 0.25);
+    return Math.abs(spot == null ? 1 : spot) * NEAR_SPOT_FRAC;
   }
 
   /** True if spot is near {@code level} relative to Call–Put span (or spot %). */
   private static boolean nearLevel(Double spot, Double call, Double put, Double level)
   {
     if (spot == null || level == null) return false;
-    double dist = Math.abs(spot - level);
-    double span = 0;
-    if (call != null && put != null) span = Math.abs(call - put);
-    double thresh;
-    if (span > 1) thresh = Math.max(span * NEAR_FRAC, Math.abs(spot) * NEAR_SPOT_FRAC * 0.25);
-    else thresh = Math.abs(spot) * NEAR_SPOT_FRAC;
-    return dist <= thresh;
+    return Math.abs(spot - level) <= levelBand(spot, call, put);
   }
 
   private void addDualLevels()
@@ -581,7 +871,7 @@ public class GexbotMajors extends Study
   /** Stack HUD panels in the chosen chart corner (badge always on top). */
   private void placeRows(java.util.List<PanelFigure> rows, boolean right, boolean bottom)
   {
-    int rowH = 28;
+    int rowH = 24;
     int n = rows.size();
     for (int i = 0; i < n; i++) {
       PanelFigure p = rows.get(i);
@@ -725,7 +1015,7 @@ public class GexbotMajors extends Study
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(8000);
       conn.setReadTimeout(8000);
-      conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.4");
+      conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.5");
       conn.setRequestProperty("Accept", "application/json");
       int code = conn.getResponseCode();
       String body = readBody(code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream());
@@ -874,7 +1164,7 @@ public class GexbotMajors extends Study
     {
       if (Util.isEmpty(text)) return;
       Rectangle gb = ctx.getBounds();
-      Font font = new Font("SansSerif", bold ? Font.BOLD : Font.PLAIN, bold ? 13 : 12);
+      Font font = new Font("SansSerif", bold ? Font.BOLD : Font.PLAIN, bold ? 12 : 11);
       gc.setFont(font);
       FontMetrics fm = gc.getFontMetrics(font);
       int tw = fm.stringWidth(text);
@@ -1049,7 +1339,7 @@ public class GexbotMajors extends Study
     conn.setConnectTimeout(10000);
     conn.setReadTimeout(15000);
     conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-    conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.4");
+    conn.setRequestProperty("User-Agent", "MotiveWave-GexbotMajors/1.5");
     conn.setRequestProperty("Accept", "application/json");
     return conn;
   }
