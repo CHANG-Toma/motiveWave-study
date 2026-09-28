@@ -7,6 +7,7 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.geom.Line2D;
+import java.awt.geom.Path2D;
 import java.awt.geom.Rectangle2D;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -23,13 +24,17 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.motivewave.platform.sdk.common.DataContext;
+import com.motivewave.platform.sdk.common.DataSeries;
 import com.motivewave.platform.sdk.common.Defaults;
 import com.motivewave.platform.sdk.common.DrawContext;
+import com.motivewave.platform.sdk.common.Enums;
 import com.motivewave.platform.sdk.common.NVP;
 import com.motivewave.platform.sdk.common.PathInfo;
 import com.motivewave.platform.sdk.common.Util;
@@ -44,21 +49,19 @@ import com.motivewave.platform.sdk.study.Study;
 import com.motivewave.platform.sdk.study.StudyHeader;
 
 /**
- * Classic majors HUD inspired by Gamma Levels style:
- * - 1 regime badge
- * - 1 compact info panel
- * - clean right-side level tags
- * - optional max-change panel
+ * Gexbot Majors — GEX walls, quadrant HUD, EMA 9/21 in trend (analysis only).
  */
 @StudyHeader(
     namespace = "com.gexbot.custom",
-    id = "GEXBOT_MAJORS",
-    name = "Gexbot Majors (Custom)",
+    id = "GEXBOT_MAJORS_ANALYSIS",
+    name = "Gexbot Majors",
     label = "Gexbot Majors",
-    desc = "Call/Put/Zero Gamma + regime + LAF/LBF setup checklist. Requires a Custom API key.",
+    desc = "GEX walls + Q1–Q4 focus HUD + EMA 9/21. Analysis study. Custom API key required.",
     menu = "Gexbot",
     overlay = true,
-    studyOverlay = true)
+    studyOverlay = true,
+    requiresVolume = false,
+    supportsBarUpdates = true)
 public class GexbotMajors extends Study
 {
   static final String API_KEY = "apiKey";
@@ -68,6 +71,7 @@ public class GexbotMajors extends Study
   static final String REFRESH_SEC = "refreshSec";
   static final String STRIKE_MULT = "strikeMult";
   static final String STRIKE_ADD = "strikeAdd";
+  static final String ATM_IV = "atmIvPct";
 
   static final String ZERO_PATH = "zeroPath";
   static final String CALL_PATH = "callPath";
@@ -80,13 +84,9 @@ public class GexbotMajors extends Study
   static final String DUAL_ZERO_PATH = "dualZeroPath";
   static final String DUAL_CALL_PATH = "dualCallPath";
   static final String DUAL_PUT_PATH = "dualPutPath";
-  static final String ATM_IV = "atmIvPct";
 
   static final String SHOW_HUD = "showHud";
   static final String SHOW_REGIME = "showRegime";
-  static final String SHOW_STRATEGY = "showStrategy";
-  static final String SHOW_CHECKLIST = "showChecklist";
-  static final String SHOW_ALIGNED = "showAligned";
   static final String SHOW_LEVEL_LABELS = "showLevelLabels";
   static final String SHOW_MAX_CHANGE = "showMaxChange";
   static final String SHOW_MAX_CHANGE_LEVELS = "showMaxChangeLevels";
@@ -94,15 +94,23 @@ public class GexbotMajors extends Study
   static final String SHOW_OI_DIVERGE = "showOiDiverge";
   static final String SHOW_ERRORS = "showErrors";
   static final String HUD_POS = "hudPosition";
+  static final String EMA9_PATH = "ema9Path";
+  static final String EMA21_PATH = "ema21Path";
+  static final String SHOW_EMA = "showEma";
 
   static final String BASE_URL = "https://api.gex.bot/v2";
   static final Path DEBUG_LOG = Path.of(System.getProperty("user.home"), "MotiveWave Extensions", "gexbot_majors_debug.txt");
+  static final String BUILD = "v2026-09-28u";
+  static final double Z_80 = 1.2815515655446004;
+  static final double OI_DIVERGE_PTS = 2.0;
 
   static final Color C_CALL = new Color(46, 204, 113);
   static final Color C_PUT = new Color(231, 76, 60);
   static final Color C_CALL_OI = new Color(26, 160, 90);
   static final Color C_PUT_OI = new Color(180, 50, 45);
   static final Color C_ZG = new Color(243, 156, 18);
+  static final Color C_EMA9 = new Color(52, 152, 219);
+  static final Color C_EMA21 = new Color(155, 89, 182);
   static final Color C_IV68 = new Color(219, 88, 228);
   static final Color C_IV80 = new Color(176, 92, 232);
   static final Color C_MX = new Color(52, 152, 219);
@@ -113,21 +121,6 @@ public class GexbotMajors extends Study
   static final Color C_REGIME_NEG = new Color(170, 35, 35);
   static final Color C_REGIME_POS = new Color(25, 120, 65);
   static final Color C_WARN = new Color(180, 120, 30);
-  static final Color C_SETUP = new Color(30, 60, 100);
-  static final Color C_SETUP_GO = new Color(20, 90, 55);
-  static final Color C_SETUP_WAIT = new Color(180, 120, 30);
-  static final Color C_SETUP_NO = new Color(170, 35, 35);
-  /** Normal z for a two-tailed 80% interval. 68% uses 1σ. */
-  static final double Z_80 = 1.2815515655446004;
-  /** Strikes farther than this (source units) count as Vol vs OI divergence. */
-  static final double OI_DIVERGE_PTS = 2.0;
-  /** Near a wall when within this fraction of the Call–Put range (fallback: 0.35% of spot). */
-  static final double NEAR_FRAC = 0.12;
-  static final double NEAR_SPOT_FRAC = 0.0035;
-  static final Color C_ALIGNED = new Color(0, 140, 70);
-  static final Color C_ALMOST = new Color(200, 140, 20);
-  /** Bars to scan for sweep + reclaim (LAF/LBF candle confirmation). */
-  static final int RECLAIM_LOOKBACK = 16;
 
   private final AtomicBoolean fetching = new AtomicBoolean(false);
   private volatile MajorsData lastData;
@@ -182,11 +175,13 @@ public class GexbotMajors extends Study
     grp.addRow(new DoubleDescriptor(ATM_IV, "ATM IV % (0 = auto VIX/VXN)", 0.0, 0.0, 200.0, 0.1));
 
     tab = sd.addTab("Display");
-    // Core: Call / Put / Zero + regime + diverge. Everything else off by default.
-    grp = tab.addGroup("Core levels");
+    grp = tab.addGroup("Walls");
     grp.addRow(new PathDescriptor(ZERO_PATH, "Zero Gamma", C_ZG, 1.0f, null, true, false, true));
     grp.addRow(new PathDescriptor(CALL_PATH, "Call Wall", C_CALL, 1.0f, null, true, false, true));
     grp.addRow(new PathDescriptor(PUT_PATH, "Put Wall", C_PUT, 1.0f, null, true, false, true));
+    grp.addRow(new BooleanDescriptor(SHOW_LEVEL_LABELS, "Level Labels (right)", true));
+    grp.addRow(new PathDescriptor(CALL_OI_PATH, "Call Wall (OI)", C_CALL_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
+    grp.addRow(new PathDescriptor(PUT_OI_PATH, "Put Wall (OI)", C_PUT_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
 
     grp = tab.addGroup("HUD");
     grp.addRow(new DiscreteDescriptor(HUD_POS, "HUD Position", "TR", Arrays.asList(
@@ -194,21 +189,21 @@ public class GexbotMajors extends Study
         new NVP("Top Left", "TL"),
         new NVP("Bottom Right", "BR"),
         new NVP("Bottom Left", "BL"))));
-    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Regime Badge (+GEX / -GEX)", true));
-    grp.addRow(new BooleanDescriptor(SHOW_ALIGNED, "ALIGNED / ALMOST Banner", true));
-    grp.addRow(new BooleanDescriptor(SHOW_STRATEGY, "LAF/LBF Setup Plan", true));
-    grp.addRow(new BooleanDescriptor(SHOW_CHECKLIST, "LAF/LBF Checklist Line", false));
-    grp.addRow(new BooleanDescriptor(SHOW_OI_DIVERGE, "Vol vs OI Diverge Flag", true));
-    grp.addRow(new BooleanDescriptor(SHOW_LEVEL_LABELS, "Level Labels (right)", true));
+    grp.addRow(new BooleanDescriptor(SHOW_REGIME, "Quadrant + focus (default HUD)", true));
+    grp.addRow(new BooleanDescriptor(SHOW_HUD, "Extra: spot / walls / net GEX", false));
+    grp.addRow(new BooleanDescriptor(SHOW_OI_DIVERGE, "Extra: Vol vs OI diverge", false));
     grp.addRow(new BooleanDescriptor(SHOW_ERRORS, "Show Errors Only", true));
 
-    grp = tab.addGroup("Optional (off by default)");
-    grp.addRow(new BooleanDescriptor(SHOW_HUD, "Compact Info Panel", false));
+    grp = tab.addGroup("EMA (Q2/Q4 trend)");
+    grp.addRow(new BooleanDescriptor(SHOW_EMA, "Show EMA 9/21 on chart", true));
+    // enabled=true, supportsMaxPoints=false, supportsDisable=true
+    grp.addRow(new PathDescriptor(EMA9_PATH, "EMA 9", C_EMA9, 2.0f, null, true, false, true));
+    grp.addRow(new PathDescriptor(EMA21_PATH, "EMA 21", C_EMA21, 2.0f, null, true, false, true));
+
+    grp = tab.addGroup("Optional overlays");
     grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE, "Max Change Panel", false));
     grp.addRow(new BooleanDescriptor(SHOW_MAX_CHANGE_LEVELS, "Max Change on Chart", false));
     grp.addRow(new BooleanDescriptor(SHOW_DUAL_HORIZON, "Overlay opposite period (0DTE↔90D)", false));
-    grp.addRow(new PathDescriptor(CALL_OI_PATH, "Call Wall (OI)", C_CALL_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
-    grp.addRow(new PathDescriptor(PUT_OI_PATH, "Put Wall (OI)", C_PUT_OI, 1.0f, new float[] { 4f, 4f }, false, false, true));
     grp.addRow(new PathDescriptor(IV68_PATH, "IV Range (68%)", C_IV68, 1.0f, new float[] { 6f, 5f }, false, false, true));
     grp.addRow(new PathDescriptor(IV80_PATH, "IV Range (80%)", C_IV80, 1.0f, new float[] { 6f, 5f }, false, false, true));
     grp.addRow(new PathDescriptor(MX_PATH, "Max Change Strikes", C_MX, 1.0f, new float[] { 3f, 4f }, false, false, true));
@@ -218,6 +213,7 @@ public class GexbotMajors extends Study
 
     var rd = createRD();
     rd.setLabelSettings(TICKER, FUTURES_TARGET, CATEGORY);
+    // EMA 9/21 are drawn as figures in drawFigures (same approach as walls) — more reliable than declarePath
   }
 
   @Override
@@ -232,7 +228,7 @@ public class GexbotMajors extends Study
     lastConversion = Conversion.identity();
     lastIv = null;
     lastSigma1 = null;
-    logDebug("onLoad");
+    logDebug("onLoad " + BUILD);
   }
 
   @Override
@@ -245,7 +241,22 @@ public class GexbotMajors extends Study
   }
 
   @Override
-  protected void calculateValues(DataContext ctx)
+  protected void calculate(int index, DataContext ctx)
+  {
+    // EMA rendered via figures in drawFigures; nothing per-bar required for GEX overlays
+  }
+
+  private static boolean isRangeQuadrant(int q)
+  {
+    return q == 1 || q == 3;
+  }
+
+  /**
+   * Do NOT override calculateValues — keeps Study's default bar loop.
+   * Draw HUD/walls/EMA and refresh GEX after MW finishes path calc.
+   */
+  @Override
+  protected void postcalculate(DataContext ctx)
   {
     latestCtx = ctx;
     drawFigures(ctx);
@@ -257,6 +268,7 @@ public class GexbotMajors extends Study
   {
     latestCtx = ctx;
     maybeFetch(ctx, false);
+    drawFigures(ctx);
   }
 
   @Override
@@ -264,6 +276,7 @@ public class GexbotMajors extends Study
   {
     latestCtx = ctx;
     maybeFetch(ctx, true);
+    drawFigures(ctx);
   }
 
   private void maybeFetch(DataContext ctx, boolean force)
@@ -352,6 +365,9 @@ public class GexbotMajors extends Study
     var series = ctx.getDataSeries();
     MajorsData data = lastData;
 
+    // Draw EMA as figures so they still show if declarePath paint is skipped (old jar / incomplete bars)
+    addEmaFigures(series);
+
     if (data != null && series != null && series.size() >= 2) {
       addLevel(ZERO_PATH, "ZERO GAMMA", convertPrice(data.zeroGamma), C_ZG, false);
       addLevel(CALL_PATH, "CALL WALL", convertPrice(data.mposVol), C_CALL, false);
@@ -370,8 +386,7 @@ public class GexbotMajors extends Study
       String pos = trim(getSettings().getString(HUD_POS));
       if (Util.isEmpty(pos)) pos = "TR";
       PanelFigure err = new PanelFigure(lastStatus, C_REGIME_NEG, Color.WHITE, false);
-      // Offset below/above the HUD stack (max ~6 rows) so it never overlaps
-      err.setPlacement(8 + 8 * 28, pos.endsWith("R"), pos.startsWith("B"));
+      err.setPlacement(8 + 2 * 28, pos.endsWith("R"), pos.startsWith("B"));
       addFigure(err);
     }
 
@@ -386,62 +401,59 @@ public class GexbotMajors extends Study
     boolean right = pos.endsWith("R");
     boolean bottom = pos.startsWith("B");
 
-    // Core HUD: regime + ALIGNED banner + LAF/LBF setup + optional diverge.
     int q = quadrant(data);
-    java.util.List<PanelFigure> rows = new java.util.ArrayList<>();
+    List<PanelFigure> rows = new ArrayList<>();
 
+    // Default HUD: quadrant + what to watch on the chart
     if (getSettings().getBoolean(SHOW_REGIME, true)) {
       String badge;
+      String focus;
       Color bg;
       switch (q) {
-        case 1 -> { badge = "+GEX  Above Flip  (range)"; bg = C_REGIME_POS; }
-        case 2 -> { badge = "-GEX  Above Flip  (moving)"; bg = C_REGIME_NEG; }
-        case 3 -> { badge = "+GEX  Below Flip  (interaction)"; bg = C_REGIME_POS; }
-        default -> { badge = "-GEX  Below Flip  (trend)"; bg = C_REGIME_NEG; }
+        case 1 -> {
+          badge = "Q1 RANGE";
+          focus = "Watch Call / Put walls — fade extremes (bounce & reject)";
+          bg = C_REGIME_POS;
+        }
+        case 2 -> {
+          badge = "Q2 MOVING";
+          focus = "Watch EMA 9/21 — pullback to EMA9, then join strength";
+          bg = C_REGIME_NEG;
+        }
+        case 3 -> {
+          badge = "Q3 INTERACTION";
+          focus = "Watch Flip + walls — fast bounce / reject at Flip & S/R";
+          bg = C_REGIME_POS;
+        }
+        default -> {
+          badge = "Q4 TRENDING";
+          focus = "Watch EMA 9/21 — pullback with the trend (tight risk)";
+          bg = C_REGIME_NEG;
+        }
       }
       rows.add(new PanelFigure(badge, bg, Color.WHITE, true));
+      rows.add(new PanelFigure(focus, C_HUD_BG, new Color(255, 220, 120), false));
     }
 
-    SetupPlan plan = buildSetupPlan(data, q, ctx);
-
-    // Compact HUD: never stack conflicting banners. Max useful rows.
-    boolean brokeNoTrade = plan.noTrade;
-    if (getSettings().getBoolean(SHOW_ALIGNED, true) && !Util.isEmpty(plan.align) && !brokeNoTrade) {
-      rows.add(new PanelFigure(plan.align, plan.alignBg, Color.WHITE, true));
-    }
-    // When ALIGNED, skip redundant SETUP (banner is enough). When BROKE, show only NO TRADE.
-    boolean showSetup = getSettings().getBoolean(SHOW_STRATEGY, true) && !Util.isEmpty(plan.setup);
-    if (showSetup && Util.isEmpty(plan.align)) {
-      rows.add(new PanelFigure(plan.setup, plan.setupBg, plan.setupFg, true));
-    }
-    else if (showSetup && brokeNoTrade) {
-      rows.add(new PanelFigure(plan.setup, plan.setupBg, plan.setupFg, true));
-    }
-    if (getSettings().getBoolean(SHOW_CHECKLIST, false) && !Util.isEmpty(plan.checklist) && !brokeNoTrade
-        && !Util.isEmpty(plan.align)) {
-      rows.add(new PanelFigure(plan.checklist, C_HUD_BG, new Color(235, 235, 235), false));
-    }
-
+    // Optional extras (off by default)
     if (getSettings().getBoolean(SHOW_HUD, false)) {
       Double zg = convertPrice(data.zeroGamma);
       Double call = convertPrice(data.mposVol);
       Double put = convertPrice(data.mnegVol);
       Double spotFx = convertPrice(data.spot);
-      String src = lastTicker + (Util.isEmpty(lastFuture) ? "" : ("->" + lastFuture));
-
+      String src = lastTicker + (Util.isEmpty(lastFuture) ? "" : ("→" + lastFuture));
       String hud = src
-          + "   Spot " + formatPrice(spotFx)
-          + "   |  Call " + formatPrice(call)
-          + "   Flip " + formatPrice(zg) + distToZg(spotFx, zg)
-          + "   Put " + formatPrice(put)
-          + "   |  Net " + formatSigned(data.netGexVol);
+          + "  Spot " + formatPrice(spotFx)
+          + "  Call " + formatPrice(call)
+          + "  Flip " + formatPrice(zg) + distToZg(spotFx, zg)
+          + "  Put " + formatPrice(put)
+          + "  Net " + formatSigned(data.netGexVol);
       rows.add(new PanelFigure(hud, C_HUD_BG, new Color(235, 235, 235), false));
     }
 
-    // Diverge only when relevant to active setup (not always — less clutter)
-    if (getSettings().getBoolean(SHOW_OI_DIVERGE, true)) {
+    if (getSettings().getBoolean(SHOW_OI_DIVERGE, false)) {
       String diverge = oiDivergeLine(data);
-      if (!Util.isEmpty(diverge) && (brokeNoTrade || !Util.isEmpty(plan.align) || plan.setup != null && plan.setup.contains("candidate"))) {
+      if (!Util.isEmpty(diverge) && isRangeQuadrant(q)) {
         rows.add(new PanelFigure(diverge, C_WARN, Color.WHITE, true));
       }
     }
@@ -454,343 +466,6 @@ public class GexbotMajors extends Study
     }
 
     placeRows(rows, right, bottom);
-  }
-
-  /**
-   * Maps GEX walls + regime to LAF/LBF playbook, and flags ALIGNED when
-   * GEX + wall side + candle sweep/reclaim all line up.
-   * Order-flow ABS still confirmed on your tape (study cannot see delta bubbles).
-   */
-  private SetupPlan buildSetupPlan(MajorsData data, int q, DataContext ctx)
-  {
-    if (data == null || data.spot == null) {
-      return SetupPlan.of(null, "SETUP: Waiting...", null, C_HUD_BG, new Color(235, 235, 235), C_ALIGNED, false);
-    }
-
-    Double spot = data.spot;
-    Double call = data.mposVol;
-    Double put = data.mnegVol;
-    Double flip = data.zeroGamma;
-    double band = levelBand(spot, call, put);
-
-    int callSide = wallSide(spot, call, band);
-    int putSide = wallSide(spot, put, band);
-    int flipSide = wallSide(spot, flip, band);
-
-    boolean callDiv = diverges(data.mposVol, data.mposOi);
-    boolean putDiv = diverges(data.mnegVol, data.mnegOi);
-    boolean nearCall = call != null && nearLevel(spot, call, put, call);
-    boolean nearPut = put != null && nearLevel(spot, call, put, put);
-    boolean nearFlip = flip != null && nearLevel(spot, call, put, flip);
-
-    boolean fadeFriendly = (q == 1 || q == 3);
-    boolean momentumBias = (q == 4 || q == 2);
-
-    Double callFx = convertPrice(call);
-    Double putFx = convertPrice(put);
-    Double flipFx = convertPrice(flip);
-    double edge = Math.max(band * 0.25, (callFx != null ? Math.abs(callFx) : 1) * 0.00012);
-
-    boolean lafReclaim = detectLafReclaim(ctx, callFx, edge);
-    boolean lbfReclaim = detectLbfReclaim(ctx, putFx, edge);
-    boolean flipLbfReclaim = detectLbfReclaim(ctx, flipFx, edge);
-    boolean flipLafReclaim = detectLafReclaim(ctx, flipFx, edge);
-
-    String setup;
-    String need;
-    Color bg;
-    Color fg = Color.WHITE;
-    int score;
-    String kind = "—";
-    boolean entryReady = false; // candle reclaim confirmed + still valid side
-    boolean gexReady = false;   // right wall + fade-friendly enough
-    boolean noTrade = false;
-
-    // --- CALL WALL → LAF short ---
-    if (call != null && callSide > 0) {
-      // Still ABOVE Call: NEVER ALIGNED for short (contradiction is dangerous).
-      kind = "LAF";
-      score = confluenceScore(q, true, callDiv, fadeFriendly);
-      setup = "NO TRADE - BROKE Call " + formatPrice(callFx) + "  |  wait close BELOW then LAF";
-      need = null;
-      bg = C_SETUP_NO;
-      entryReady = false;
-      gexReady = false;
-      noTrade = true;
-    }
-    else if (call != null && callSide == 0 && putSide >= 0) {
-      kind = "LAF";
-      score = confluenceScore(q, false, callDiv, fadeFriendly);
-      gexReady = fadeFriendly && score >= 2 && !callDiv;
-      entryReady = false; // testing Call: not aligned until close below
-      if (momentumBias && q == 4) {
-        setup = "SETUP: Testing Call " + formatPrice(callFx)
-            + " — Q4: LAF only if reclaim confirmed.  " + confluenceLabel(kind, q, score);
-        bg = C_SETUP_WAIT;
-      }
-      else {
-        setup = "SETUP: LAF candidate @ Call " + formatPrice(callFx)
-            + " — short ONLY after lose Call.  " + confluenceLabel(kind, q, score);
-        bg = fadeFriendly ? C_SETUP_GO : C_SETUP_WAIT;
-      }
-      need = "NEED LAF (tick all 5): VP · swept ABOVE Call · aggressive buys · BUY ABS · close BELOW Call. Else PASS.";
-    }
-    else if (call != null && callSide < 0 && nearCall && putSide > 0) {
-      kind = "LAF";
-      score = confluenceScore(q, false, callDiv, fadeFriendly);
-      gexReady = fadeFriendly && score >= 2 && !callDiv;
-      entryReady = lafReclaim && callSide < 0;
-      setup = "SETUP: Approaching Call " + formatPrice(callFx)
-          + " — prepare LAF short. Do not pre-short.  " + confluenceLabel(kind, q, score);
-      need = "NEED LAF: wait sweep above Call → BUY ABS → close below Call. Target Flip "
-          + formatPrice(flipFx);
-      bg = C_SETUP;
-      fg = new Color(235, 235, 235);
-    }
-    // --- PUT WALL → LBF long ---
-    else if (put != null && putSide < 0) {
-      kind = "LBF";
-      score = confluenceScore(q, true, putDiv, fadeFriendly);
-      setup = "NO TRADE - BROKE Put " + formatPrice(putFx) + "  |  wait close ABOVE then LBF";
-      need = null;
-      bg = C_SETUP_NO;
-      entryReady = false;
-      gexReady = false;
-      noTrade = true;
-    }
-    else if (put != null && putSide == 0 && callSide <= 0) {
-      kind = "LBF";
-      score = confluenceScore(q, false, putDiv, fadeFriendly);
-      gexReady = fadeFriendly && score >= 2 && !putDiv;
-      entryReady = false; // testing Put: not aligned until close above
-      if (momentumBias && q == 4) {
-        setup = "SETUP: Testing Put " + formatPrice(putFx)
-            + " — Q4: LBF only if reclaim confirmed.  " + confluenceLabel(kind, q, score);
-        bg = C_SETUP_WAIT;
-      }
-      else {
-        setup = "SETUP: LBF candidate @ Put " + formatPrice(putFx)
-            + " — long ONLY after reclaim Put.  " + confluenceLabel(kind, q, score);
-        bg = fadeFriendly ? C_SETUP_GO : C_SETUP_WAIT;
-      }
-      need = "NEED LBF (tick all 5): VP · swept BELOW Put · aggressive sells · SELL ABS · close ABOVE Put. Else PASS.";
-    }
-    else if (put != null && putSide > 0 && nearPut && callSide < 0) {
-      kind = "LBF";
-      score = confluenceScore(q, false, putDiv, fadeFriendly);
-      gexReady = fadeFriendly && score >= 2 && !putDiv;
-      entryReady = lbfReclaim && putSide > 0;
-      setup = "SETUP: Approaching Put " + formatPrice(putFx)
-          + " — prepare LBF long. Do not pre-buy.  " + confluenceLabel(kind, q, score);
-      need = "NEED LBF: wait sweep below Put → SELL ABS → close above Put. Target Flip "
-          + formatPrice(flipFx);
-      bg = C_SETUP;
-      fg = new Color(235, 235, 235);
-    }
-    // --- FLIP ---
-    else if (flip != null && (flipSide == 0 || nearFlip)) {
-      score = fadeFriendly ? 2 : 0;
-      if (spot >= flip) {
-        kind = "LBF";
-        gexReady = fadeFriendly;
-        entryReady = flipLbfReclaim;
-        setup = "SETUP: At Flip from above — LBF if swept below Flip & reclaim.  "
-            + confluenceLabel(kind, q, score);
-        need = "NEED: sweep BELOW Flip · SELL ABS · close ABOVE Flip → long.";
-      }
-      else {
-        kind = "LAF";
-        gexReady = fadeFriendly;
-        entryReady = flipLafReclaim;
-        setup = "SETUP: At Flip from below — LAF if swept above Flip & lose.  "
-            + confluenceLabel(kind, q, score);
-        need = "NEED: sweep ABOVE Flip · BUY ABS · close BELOW Flip → short.";
-      }
-      bg = C_SETUP_WAIT;
-    }
-    else if (q == 4) {
-      score = -2;
-      setup = "SETUP: Mid-range Q4 TRENDING -GEX — momentum > fade.  Confluence LOW";
-      need = "NEED: wait Call/Put/Flip test. LAF/LBF only with full checklist.";
-      bg = C_SETUP_WAIT;
-    }
-    else if (q == 2) {
-      score = 0;
-      setup = "SETUP: Mid-range Q2 MOVING -GEX — size down.  Confluence LOW";
-      need = "NEED: no mid entries. At wall use LAF/LBF checklist.";
-      bg = C_SETUP_WAIT;
-    }
-    else if (q == 3) {
-      score = 2;
-      setup = "SETUP: Mid below Flip +GEX — Flip magnet. Wait for test.  Confluence MED";
-      need = "NEED: LAF @ Call / LBF @ Put / Flip reclaim only. Tick all 5 or PASS.";
-      bg = C_SETUP;
-      fg = new Color(235, 235, 235);
-    }
-    else {
-      score = 1;
-      setup = "SETUP: Mid-range Q1 +GEX — wait extremes.  Confluence IDLE";
-      need = "NEED: no mid entries. Prepare LAF @ Call or LBF @ Put.";
-      bg = C_SETUP;
-      fg = new Color(235, 235, 235);
-    }
-
-    if (!noTrade) {
-      if (callDiv && putDiv) setup += "  Walls Vol!=OI";
-      else if (callDiv) setup += "  Call Vol!=OI";
-      else if (putDiv) setup += "  Put Vol!=OI";
-    }
-
-    // --- ALIGNED banner ---
-    String align = null;
-    Color alignBg = C_ALIGNED;
-    boolean wallOk = ("LAF".equals(kind) && !callDiv) || ("LBF".equals(kind) && !putDiv);
-
-    // Hard rule: never ALIGNED during BROKE / NO TRADE
-    if (!noTrade && entryReady && gexReady && wallOk
-        && (("LAF".equals(kind) && lastCloseBelow(ctx, callFx, edge))
-            || ("LBF".equals(kind) && lastCloseAbove(ctx, putFx, edge)))) {
-      if ("LAF".equals(kind)) {
-        align = "ALIGNED - LAF SHORT  |  below Call + reclaim OK  |  confirm BUY ABS";
-      }
-      else if ("LBF".equals(kind)) {
-        align = "ALIGNED - LBF LONG  |  above Put + reclaim OK  |  confirm SELL ABS";
-      }
-      alignBg = C_ALIGNED;
-    }
-    else if (!noTrade && gexReady && wallOk && ("LAF".equals(kind) || "LBF".equals(kind))) {
-      align = "ALMOST - " + kind + " GEX OK  |  waiting reclaim close";
-      alignBg = C_ALMOST;
-    }
-
-    return SetupPlan.of(align, setup, need, bg, fg, alignBg, noTrade);
-  }
-
-  private static boolean lastCloseBelow(DataContext ctx, Double levelFx, double edge)
-  {
-    if (ctx == null || levelFx == null) return false;
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 1) return false;
-    return series.getClose(series.size() - 1) < levelFx - edge;
-  }
-
-  private static boolean lastCloseAbove(DataContext ctx, Double levelFx, double edge)
-  {
-    if (ctx == null || levelFx == null) return false;
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 1) return false;
-    return series.getClose(series.size() - 1) > levelFx + edge;
-  }
-
-  /** LAF: recent high swept above level, then a close back below. */
-  private static boolean detectLafReclaim(DataContext ctx, Double levelFx, double edge)
-  {
-    if (ctx == null || levelFx == null) return false;
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 3) return false;
-    int n = series.size();
-    int from = Math.max(0, n - RECLAIM_LOOKBACK);
-    boolean swept = false;
-    for (int i = from; i < n; i++) {
-      if (series.getHigh(i) > levelFx + edge) swept = true;
-      if (swept && series.getClose(i) < levelFx - edge) return true;
-    }
-    return false;
-  }
-
-  /** LBF: recent low swept below level, then a close back above. */
-  private static boolean detectLbfReclaim(DataContext ctx, Double levelFx, double edge)
-  {
-    if (ctx == null || levelFx == null) return false;
-    var series = ctx.getDataSeries();
-    if (series == null || series.size() < 3) return false;
-    int n = series.size();
-    int from = Math.max(0, n - RECLAIM_LOOKBACK);
-    boolean swept = false;
-    for (int i = from; i < n; i++) {
-      if (series.getLow(i) < levelFx - edge) swept = true;
-      if (swept && series.getClose(i) > levelFx + edge) return true;
-    }
-    return false;
-  }
-
-  private static int confluenceScore(int q, boolean alreadyBroke, boolean wallDiv, boolean fadeFriendly)
-  {
-    int score = 0;
-    if (fadeFriendly) score += 2;
-    if (q == 1) score += 1;
-    if (q == 4) score -= 2;
-    if (q == 2) score -= 1;
-    if (alreadyBroke) score -= 1;
-    if (wallDiv) score -= 1;
-    return score;
-  }
-
-  private static String confluenceLabel(String kind, int q, int score)
-  {
-    String tier = score >= 3 ? "HIGH" : (score >= 1 ? "MED" : "LOW");
-    return "Confluence " + tier + " (" + kind + "/Q" + q + ")";
-  }
-
-  /** Kept for any leftover call sites. */
-  private static String confluence(String kind, int q, boolean alreadyBroke, boolean wallDiv, boolean fadeFriendly)
-  {
-    return confluenceLabel(kind, q, confluenceScore(q, alreadyBroke, wallDiv, fadeFriendly));
-  }
-
-  static final class SetupPlan
-  {
-    final String align;
-    final String setup;
-    final String checklist;
-    final Color setupBg;
-    final Color setupFg;
-    final Color alignBg;
-    final boolean noTrade;
-
-    SetupPlan(String align, String setup, String checklist, Color setupBg, Color setupFg, Color alignBg, boolean noTrade)
-    {
-      this.align = align;
-      this.setup = setup;
-      this.checklist = checklist;
-      this.setupBg = setupBg;
-      this.setupFg = setupFg;
-      this.alignBg = alignBg;
-      this.noTrade = noTrade;
-    }
-
-    static SetupPlan of(String align, String setup, String checklist, Color bg, Color fg, Color alignBg, boolean noTrade)
-    {
-      return new SetupPlan(align, setup, checklist, bg, fg, alignBg, noTrade);
-    }
-  }
-
-  /**
-   * Which side of a wall: -1 below, 0 testing (within band), +1 above (broke).
-   * Band is half the "near" threshold so "broke" triggers as soon as price clears the wall.
-   */
-  private static int wallSide(Double spot, Double level, double band)
-  {
-    if (spot == null || level == null) return 0;
-    double edge = Math.max(band * 0.35, Math.abs(level) * 0.00015);
-    if (spot > level + edge) return 1;
-    if (spot < level - edge) return -1;
-    return 0;
-  }
-
-  private static double levelBand(Double spot, Double call, Double put)
-  {
-    double span = 0;
-    if (call != null && put != null) span = Math.abs(call - put);
-    if (span > 1) return Math.max(span * NEAR_FRAC, Math.abs(spot == null ? 0 : spot) * NEAR_SPOT_FRAC * 0.25);
-    return Math.abs(spot == null ? 1 : spot) * NEAR_SPOT_FRAC;
-  }
-
-  /** True if spot is near {@code level} relative to Call–Put span (or spot %). */
-  private static boolean nearLevel(Double spot, Double call, Double put, Double level)
-  {
-    if (spot == null || level == null) return false;
-    return Math.abs(spot - level) <= levelBand(spot, call, put);
   }
 
   private void addDualLevels()
@@ -833,7 +508,6 @@ public class GexbotMajors extends Study
     return category;
   }
 
-  /** Opposite structural period for overlay: 0DTE↔90D, 1DTE→90D. */
   private static String dualCategoryFor(String category)
   {
     if (Util.isEmpty(category)) return "gex_full";
@@ -850,7 +524,7 @@ public class GexbotMajors extends Study
     boolean callDiv = diverges(data.mposVol, data.mposOi);
     boolean putDiv = diverges(data.mnegVol, data.mnegOi);
     if (!callDiv && !putDiv) return null;
-    StringBuilder sb = new StringBuilder("DIVERGE Vol!=OI");
+    StringBuilder sb = new StringBuilder("DIVERGE Vol≠OI");
     if (callDiv) {
       sb.append("  Call ").append(formatPrice(convertPrice(data.mposVol)))
           .append(" vs ").append(formatPrice(convertPrice(data.mposOi)));
@@ -868,8 +542,7 @@ public class GexbotMajors extends Study
     return Math.abs(vol - oi) >= OI_DIVERGE_PTS;
   }
 
-  /** Stack HUD panels in the chosen chart corner (badge always on top). */
-  private void placeRows(java.util.List<PanelFigure> rows, boolean right, boolean bottom)
+  private void placeRows(List<PanelFigure> rows, boolean right, boolean bottom)
   {
     int rowH = 24;
     int n = rows.size();
@@ -881,10 +554,6 @@ public class GexbotMajors extends Study
     }
   }
 
-  /**
-   * 4 Quadrants: flip = spot vs zero gamma, GEX sign = net gex (volume).
-   * Q1 Above+Pos, Q2 Above+Neg, Q3 Below+Pos, Q4 Below+Neg.
-   */
   private static int quadrant(MajorsData data)
   {
     boolean aboveFlip = data.spot == null || data.zeroGamma == null || data.spot >= data.zeroGamma;
@@ -921,23 +590,6 @@ public class GexbotMajors extends Study
     return " (" + (d >= 0 ? "+" : "") + String.format("%.0f", d) + ")";
   }
 
-  private String ivHudSuffix(MajorsData data)
-  {
-    if (lastSigma1 == null || data == null || data.spot == null) return "";
-    Double one = convertMove(lastSigma1);
-    Double eighty = convertMove(lastSigma1 * Z_80);
-    String ivPct = lastIv == null ? "" : String.format("  IV %.1f%%", lastIv * 100.0);
-    return "   |  IV68 ±" + formatPrice(one) + "  IV80 ±" + formatPrice(eighty) + ivPct;
-  }
-
-  private Double convertMove(double sourcePoints)
-  {
-    Double a = convertPrice(0.0);
-    Double b = convertPrice(sourcePoints);
-    if (a == null || b == null) return sourcePoints;
-    return Math.abs(b - a);
-  }
-
   private boolean ivRangeEnabled()
   {
     PathInfo a = getSettings().getPath(IV68_PATH);
@@ -969,7 +621,6 @@ public class GexbotMajors extends Study
     return data.spot * iv * Math.sqrt(dte / 365.0);
   }
 
-  /** gexbot 0DTE formula: seconds remaining to 16:00 ET / 86400. */
   private static double remainingDteDays(String category)
   {
     ZoneId ny = ZoneId.of("America/New_York");
@@ -1033,6 +684,43 @@ public class GexbotMajors extends Study
     }
   }
 
+  private void addEmaFigures(DataSeries series)
+  {
+    if (series == null || series.size() < 2) return;
+    if (!getSettings().getBoolean(SHOW_EMA, true)) return;
+
+    addEmaFigure(series, 9, EMA9_PATH, C_EMA9);
+    addEmaFigure(series, 21, EMA21_PATH, C_EMA21);
+  }
+
+  private void addEmaFigure(DataSeries series, int period, String pathKey, Color fallback)
+  {
+    // Style from PathDescriptor if present; do NOT gate on path.isEnabled()
+    // (saved study settings often leave new path keys disabled)
+    PathInfo path = getSettings().getPath(pathKey);
+    Color color = (path != null && path.getColor() != null) ? path.getColor() : fallback;
+    float width = (path != null && path.getStrokeWidth() > 0) ? path.getStrokeWidth() : 2.0f;
+
+    int n = series.size();
+    long[] times = new long[n];
+    double[] vals = new double[n];
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+      Double v = series.ema(i, period, Enums.BarInput.CLOSE);
+      if (v == null) continue;
+      times[count] = series.getStartTime(i);
+      vals[count] = v;
+      count++;
+    }
+    if (count < 2) return;
+
+    if (count != n) {
+      times = Arrays.copyOf(times, count);
+      vals = Arrays.copyOf(vals, count);
+    }
+    addFigure(new EmaPathFigure(times, vals, color, width));
+  }
+
   private void addLevel(String pathKey, String name, Double price, Color fallbackColor, boolean dashed)
   {
     if (price == null || Double.isNaN(price)) return;
@@ -1051,7 +739,65 @@ public class GexbotMajors extends Study
     addFigure(new LevelFigure(price, color, width, label, dashed));
   }
 
-  /** Solid thin level line with a plain colored text label above it. */
+  private static class EmaPathFigure extends Figure
+  {
+    private final long[] times;
+    private final double[] vals;
+    private final Color color;
+    private final float width;
+    private Path2D.Double path;
+
+    EmaPathFigure(long[] times, double[] vals, Color color, float width)
+    {
+      this.times = times;
+      this.vals = vals;
+      this.color = color;
+      this.width = width;
+    }
+
+    @Override
+    public boolean isVisible(DrawContext ctx)
+    {
+      return true;
+    }
+
+    @Override
+    public void layout(DrawContext ctx)
+    {
+      path = new Path2D.Double();
+      boolean started = false;
+      double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+      double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+      for (int i = 0; i < times.length; i++) {
+        double x = ctx.translateTimeD(times[i]);
+        double y = ctx.translateValueD(vals[i]);
+        if (!started) {
+          path.moveTo(x, y);
+          started = true;
+        }
+        else {
+          path.lineTo(x, y);
+        }
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+      if (started) {
+        setBounds(new Rectangle2D.Double(minX, minY, Math.max(1, maxX - minX), Math.max(1, maxY - minY)));
+      }
+    }
+
+    @Override
+    public void draw(Graphics2D gc, DrawContext ctx)
+    {
+      if (path == null) return;
+      gc.setStroke(new BasicStroke(width));
+      gc.setColor(color);
+      gc.draw(path);
+    }
+  }
+
   private static class LevelFigure extends Figure
   {
     private final double price;
@@ -1105,7 +851,6 @@ public class GexbotMajors extends Study
         FontMetrics fm = gc.getFontMetrics(font);
         Rectangle gb = ctx.getBounds();
         int tw = fm.stringWidth(label);
-        // Plain colored text just above the line, right-aligned
         int tx = (int) gb.getMaxX() - tw - 12;
         int ty = (int) Math.round(line.getY1()) - 5;
         gc.setColor(color);
@@ -1114,7 +859,6 @@ public class GexbotMajors extends Study
     }
   }
 
-  /** Screen-space HUD panel anchored in a chart corner (TL/TR/BL/BR). */
   private static class PanelFigure extends Figure
   {
     private final String text;
@@ -1150,7 +894,6 @@ public class GexbotMajors extends Study
     @Override
     public void layout(DrawContext ctx)
     {
-      // Hit-test area = the panel box only (estimated; refined in draw).
       Rectangle gb = ctx.getBounds();
       int boxW = (text == null ? 0 : text.length() * 7) + 20;
       int boxH = 24;
@@ -1396,16 +1139,11 @@ public class GexbotMajors extends Study
   private static String formatSigned(Double v)
   {
     if (v == null || Double.isNaN(v)) return "-";
-    String s = String.format("%.0f", Math.abs(v));
+    String s;
     if (Math.abs(v) >= 1000) s = String.format("%.1fk", v / 1000.0);
     else s = String.format("%.0f", v);
     if (v > 0 && !s.startsWith("+")) return "+" + s;
     return s;
-  }
-
-  private static String formatSigned(double v)
-  {
-    return formatSigned(Double.valueOf(v));
   }
 
   static class ResolvedRequest
