@@ -1,6 +1,8 @@
 # Compile and deploy custom MotiveWave studies/strategies
-# - gexbot -> gexbot_majors.jar
-# - qulla  -> qulla_nq.jar
+# - gexbot  -> gexbot_majors.jar
+# - qulla   -> qulla_nq.jar
+# - emavwap -> ema_vwap_cross.jar
+# - trendtarget -> ttr_alma.jar
 # Always refreshes Extensions/dev + .last_updated.
 # Replaces jars when unlocked; if locked, stages *.jar.new — never kills MotiveWave.
 
@@ -46,10 +48,10 @@ Remove-Item -Recurse -Force $classesDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $classesDir | Out-Null
 
 $sources = @(Get-ChildItem -Path $srcDir -Recurse -Filter "*.java" |
-  Where-Object { $_.FullName -match '[\\/](gexbot|qulla)[\\/]' } |
+  Where-Object { $_.FullName -match '[\\/](gexbot|qulla|emavwap|trendtarget)[\\/]' } |
   ForEach-Object { $_.FullName })
 
-if ($sources.Count -lt 1) { throw "No gexbot/qulla java sources found" }
+if ($sources.Count -lt 1) { throw "No gexbot/qulla/emavwap/trendtarget java sources found" }
 Write-Host "Compiling $($sources.Count) files..."
 
 # mwave_sdk.jar is Java 26 bytecode; compile with matching release.
@@ -128,6 +130,8 @@ try {
   Write-Host "WARN could not write $freshName"
 }
 $okQulla = Deploy-Jar "qulla" "qulla_nq.jar"
+$okEma = Deploy-Jar "emavwap" "ema_vwap_cross.jar"
+$okTtr = Deploy-Jar "trendtarget" "ttr_alma.jar"
 # Never kill MotiveWave. Locked jars stay as *.jar.new; Extensions/dev is always refreshed.
 
 [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString() |
@@ -138,12 +142,14 @@ $stamp = @(
   "deployed_utc=$([DateTimeOffset]::UtcNow.ToString('o'))"
   "gexbot_jar_ok=$okGex"
   "qulla_jar_ok=$okQulla"
+  "emavwap_jar_ok=$okEma"
+  "trendtarget_jar_ok=$okTtr"
 ) -join "`n"
 Set-Content -Path $statusPath -Value $stamp
 
 Write-Host "OK classes: $devDir"
 Write-Host "OK .last_updated refreshed"
-if ($okGex -and $okQulla) {
+if ($okGex -and $okQulla -and $okEma -and $okTtr) {
   Write-Host "Jars CURRENT. Hot-reload via Extensions/dev; remove/re-add study if needed."
 }
 else {
